@@ -1,0 +1,11 @@
+*.csv
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Common generated outputs
+build/
+dist/
+out/
+output/
