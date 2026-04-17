@@ -2,6 +2,12 @@
 
 `patch_generator.py` is a desktop tool for creating and editing patch-definition CSV files from a live webcam feed.
 
+It fits into the reactive LED workflow like this:
+
+1. draw patches here and save a CSV
+2. convert that CSV with [`../patch-to-header/`](../patch-to-header/README.md)
+3. include the generated header in a firmware sketch such as `ReactiveLEDs_LoadablePatches`
+
 It lets a user:
 - view a live camera image
 - place `quadpatch` regions by clicking 4 points
