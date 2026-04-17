@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import ctypes
 import csv
 import colorsys
 import math
 import random
+import socket
+import sys
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+import zlib
 
 import numpy as np
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 
 try:
@@ -38,7 +43,10 @@ except ModuleNotFoundError as exc:
 
 
 APP_TITLE = "Webcam Patch Tracker"
+WINDOWS_APP_ID = "org.janelia.patch_generator"
 SCRIPT_DIR = Path(__file__).resolve().parent
+ASSETS_DIR = SCRIPT_DIR / "assets"
+FAVICON_PATH = ASSETS_DIR / "patch_generator_favicon.png"
 PREVIEW_RED_BGR = (0, 0, 255)
 PREVIEW_RED_OUTLINE = "#FF0000"
 PREVIEW_RED_FILL_ALPHA = 0.30
@@ -49,6 +57,29 @@ DISPLAY_POLL_MS = 15
 CAMERA_FRAME_WIDTH = 1280
 CAMERA_FRAME_HEIGHT = 720
 CAMERA_FPS = 60
+SELECTED_OUTLINE_BGR = (0, 255, 255)
+SELECTED_FILL_ALPHA = 0.18
+EDIT_HANDLE_RADIUS = 7
+EDIT_HIT_RADIUS = 12
+EDGE_HIT_DISTANCE = 10
+SHIFT_MASK = 0x0001
+SELECTED_VERTEX_BGR = (255, 255, 255)
+HOVER_HANDLE_RADIUS_DELTA = 3
+UI_BG = "#232529"
+UI_PANEL_BG = "#2C2F34"
+UI_PANEL_ALT_BG = "#353940"
+UI_BORDER = "#4A5059"
+UI_TEXT = "#ECEFF4"
+UI_MUTED_TEXT = "#B4BCC7"
+UI_ACCENT = "#8FA3B8"
+UI_ACCENT_ACTIVE = "#A7B7C7"
+UI_BUTTON_DISABLED = "#23262B"
+UI_BUTTON_DISABLED_TEXT = "#727B86"
+UI_CANVAS_BG = "#1B1D21"
+INSTANCE_HOST = "127.0.0.1"
+INSTANCE_PORT = 49152 + (zlib.crc32(str(SCRIPT_DIR).encode("utf-8")) % 12000)
+INSTANCE_SHUTDOWN_MESSAGE = b"shutdown"
+INSTANCE_STARTUP_TIMEOUT_S = 5.0
 
 
 @dataclass
@@ -58,6 +89,7 @@ class PatchRecord:
     geometry: tuple[float, ...]
     color_rgb: tuple[int, int, int]
     table_tag: str
+    wall_adjacent: bool = False
 
     @property
     def outline_hex(self) -> str:
@@ -74,6 +106,71 @@ class PatchRecord:
         return (b, g, r)
 
 
+@dataclass
+class EditDragState:
+    patch_tag: str
+    drag_mode: str
+    start_point: tuple[int, int]
+    original_geometry: tuple[float, ...]
+    handle_index: int | None = None
+    original_circle_handle_angle: float | None = None
+
+
+class InvalidPatchDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Misc, patch_name: str, reason: str) -> None:
+        super().__init__(parent)
+        self.result = "edit"
+        self.title("Invalid Patch")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        self.configure(bg=UI_BG)
+
+        self.columnconfigure(0, weight=1)
+
+        message = (
+            f'"{patch_name}" is currently invalid:\n{reason}\n\n'
+            "Choose Edit to keep working on it, or Cancel to discard changes made while it was selected."
+        )
+        ttk.Label(self, text=message, justify="left", wraplength=340).grid(
+            row=0, column=0, padx=16, pady=(16, 10), sticky="w"
+        )
+
+        button_row = ttk.Frame(self)
+        button_row.grid(row=1, column=0, padx=16, pady=(0, 16), sticky="e")
+        ttk.Button(button_row, text="Cancel", command=self.choose_cancel, style="Compact.TButton").pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
+        ttk.Button(button_row, text="Edit", command=self.choose_edit, style="Compact.TButton").pack(side=tk.LEFT)
+
+        self.protocol("WM_DELETE_WINDOW", self.choose_edit)
+        self.bind("<Escape>", lambda _event: self.choose_edit())
+        self.bind("<Return>", lambda _event: self.choose_edit())
+
+        self.update_idletasks()
+        self._center_on_parent(parent)
+
+    def _center_on_parent(self, parent: tk.Misc) -> None:
+        parent.update_idletasks()
+        parent_x = parent.winfo_rootx()
+        parent_y = parent.winfo_rooty()
+        parent_w = parent.winfo_width()
+        parent_h = parent.winfo_height()
+        width = self.winfo_width()
+        height = self.winfo_height()
+        x_pos = parent_x + max((parent_w - width) // 2, 0)
+        y_pos = parent_y + max((parent_h - height) // 2, 0)
+        self.geometry(f"+{x_pos}+{y_pos}")
+
+    def choose_edit(self) -> None:
+        self.result = "edit"
+        self.destroy()
+
+    def choose_cancel(self) -> None:
+        self.result = "cancel"
+        self.destroy()
+
+
 class NamePrompt(tk.Toplevel):
     def __init__(self, parent: tk.Misc, title: str, prompt: str) -> None:
         super().__init__(parent)
@@ -82,6 +179,7 @@ class NamePrompt(tk.Toplevel):
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
+        self.configure(bg=UI_BG)
 
         self.columnconfigure(0, weight=1)
 
@@ -94,8 +192,10 @@ class NamePrompt(tk.Toplevel):
 
         button_row = ttk.Frame(self)
         button_row.grid(row=2, column=0, padx=16, pady=(0, 16), sticky="e")
-        ttk.Button(button_row, text="Cancel", command=self.cancel).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(button_row, text="Save", command=self.save).pack(side=tk.LEFT)
+        ttk.Button(button_row, text="Cancel", command=self.cancel, style="Compact.TButton").pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
+        ttk.Button(button_row, text="Save", command=self.save, style="Compact.TButton").pack(side=tk.LEFT)
 
         self.bind("<Return>", lambda _event: self.save())
         self.bind("<Escape>", lambda _event: self.cancel())
@@ -134,15 +234,21 @@ class WebcamPatchApp:
         self.root = root
         self.root.title(APP_TITLE)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.bind("<Return>", self.on_return_key)
+        self.root.bind("<Escape>", self.on_escape_key)
+        self.root.bind_all("<Delete>", self.on_delete_key)
+        self.root.bind_all("<BackSpace>", self.on_delete_key)
 
         self.current_csv_path: Path | None = None
         self.patches: list[PatchRecord] = []
         self.current_mode: str | None = None
         self.temp_points: list[tuple[int, int]] = []
+        self.circle_creation_drag_active = False
         self.mouse_position: tuple[int, int] | None = None
         self.frame_size: tuple[int, int] | None = None
         self.display_region: tuple[int, int, int, int] | None = None
         self.video_photo: ImageTk.PhotoImage | None = None
+        self.window_icon: ImageTk.PhotoImage | None = None
         self.video_item: int | None = None
         self.waiting_text_item: int | None = None
         self.tag_counter = 0
@@ -158,18 +264,153 @@ class WebcamPatchApp:
         self.latest_render_token = 0
         self.last_shown_render_token = -1
         self.video_ready = False
+        self.selected_patch_tag: str | None = None
+        self.selected_patch_original_geometry: tuple[float, ...] | None = None
+        self.selected_patch_original_wall_adjacent: bool | None = None
+        self.selected_patch_original_circle_handle_angle: float | None = None
+        self.selected_patch_has_unsaved_changes = False
+        self.edit_drag_state: EditDragState | None = None
+        self.selected_vertex_index: int | None = None
+        self.hovered_handle_key: tuple[str, str, int | None] | None = None
+        self.circle_handle_angles: dict[str, float] = {}
+        self.ignore_table_select_event = False
+        self.button_style_name = "Compact.TButton"
+        self.instance_listener_socket: socket.socket | None = None
+        self.instance_listener_thread: threading.Thread | None = None
 
         self.status_var = tk.StringVar(value="Waiting for video feed...")
         self.file_var = tk.StringVar(value="CSV: none")
 
+        self._configure_window_icon()
         self._build_ui()
+        self._configure_window_chrome()
         self.render_thread = threading.Thread(target=self.render_loop, name="camera-render", daemon=True)
         self.render_thread.start()
         self._schedule_display_refresh()
 
+    def _configure_window_icon(self) -> None:
+        if not FAVICON_PATH.exists():
+            return
+
+        try:
+            self.window_icon = ImageTk.PhotoImage(file=str(FAVICON_PATH))
+            self.root.iconphoto(True, self.window_icon)
+        except (tk.TclError, OSError):
+            self.window_icon = None
+
+    def _configure_window_chrome(self) -> None:
+        if sys.platform != "win32":
+            return
+
+        try:
+            self.root.update_idletasks()
+            hwnd = self.root.winfo_id()
+            dark_mode = ctypes.c_int(1)
+            dwmapi = ctypes.windll.dwmapi
+            for attribute in (20, 19):
+                result = dwmapi.DwmSetWindowAttribute(
+                    hwnd,
+                    attribute,
+                    ctypes.byref(dark_mode),
+                    ctypes.sizeof(dark_mode),
+                )
+                if result == 0:
+                    break
+        except Exception:
+            return
+
+    def start_instance_listener(self, listener_socket: socket.socket) -> None:
+        self.instance_listener_socket = listener_socket
+        self.instance_listener_thread = threading.Thread(
+            target=self.instance_listener_loop,
+            name="instance-listener",
+            daemon=True,
+        )
+        self.instance_listener_thread.start()
+
+    def instance_listener_loop(self) -> None:
+        listener_socket = self.instance_listener_socket
+        if listener_socket is None:
+            return
+
+        while not self.stop_event.is_set():
+            try:
+                connection, _address = listener_socket.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            with connection:
+                try:
+                    message = connection.recv(64)
+                except OSError:
+                    continue
+                if message.strip() == INSTANCE_SHUTDOWN_MESSAGE:
+                    self.root.after(0, self.on_close)
+                    break
+
     def _build_ui(self) -> None:
         style = ttk.Style()
-        self.canvas_bg = style.lookup("TFrame", "background") or self.root.cget("bg")
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        self.root.configure(bg=UI_BG)
+        style.configure(".", background=UI_BG, foreground=UI_TEXT)
+        style.configure("TFrame", background=UI_BG)
+        style.configure("TLabel", background=UI_BG, foreground=UI_TEXT)
+        style.configure("TLabelframe", background=UI_BG, foreground=UI_TEXT, borderwidth=1, relief="solid")
+        style.configure("TLabelframe.Label", background=UI_BG, foreground=UI_TEXT)
+        self._configure_button_style(style)
+        style.configure(
+            "TEntry",
+            fieldbackground=UI_PANEL_ALT_BG,
+            foreground=UI_TEXT,
+            insertcolor=UI_TEXT,
+            bordercolor=UI_BORDER,
+            lightcolor=UI_BORDER,
+            darkcolor=UI_BORDER,
+        )
+        style.map("TEntry", fieldbackground=[("focus", UI_PANEL_ALT_BG)])
+        style.configure(
+            "Vertical.TScrollbar",
+            background=UI_PANEL_ALT_BG,
+            troughcolor=UI_BG,
+            bordercolor=UI_BORDER,
+            arrowcolor=UI_TEXT,
+            lightcolor=UI_PANEL_ALT_BG,
+            darkcolor=UI_PANEL_ALT_BG,
+        )
+
+        self.canvas_bg = UI_CANVAS_BG
+        tree_bg = UI_PANEL_BG
+        tree_fg = UI_TEXT
+        self.table_style_name = "Patch.Treeview"
+        style.configure(self.table_style_name, background=tree_bg, fieldbackground=tree_bg, foreground=tree_fg)
+        style.map(
+            self.table_style_name,
+            background=[("selected", tree_bg)],
+            foreground=[("selected", tree_fg)],
+        )
+        style.configure(
+            "Treeview.Heading",
+            background=UI_PANEL_ALT_BG,
+            foreground=UI_TEXT,
+            bordercolor=UI_BORDER,
+            lightcolor=UI_PANEL_ALT_BG,
+            darkcolor=UI_PANEL_ALT_BG,
+        )
+        style.map(
+            "Treeview.Heading",
+            background=[("active", UI_ACCENT_ACTIVE), ("pressed", UI_ACCENT)],
+            foreground=[("active", UI_BG), ("pressed", UI_BG)],
+        )
+        base_font = tkfont.nametofont("TkDefaultFont")
+        self.table_row_font = base_font.copy()
+        self.table_selected_font = base_font.copy()
+        self.table_selected_font.configure(weight="bold", slant="italic", underline=1)
 
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
@@ -187,7 +428,9 @@ class WebcamPatchApp:
 
         self.canvas = tk.Canvas(video_frame, width=960, height=720, bg=self.canvas_bg, highlightthickness=0)
         self.canvas.grid(row=0, column=0, sticky="nsew")
-        self.canvas.bind("<Button-1>", self.on_canvas_click)
+        self.canvas.bind("<ButtonPress-1>", self.on_canvas_press)
+        self.canvas.bind("<B1-Motion>", self.on_canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
         self.canvas.bind("<Motion>", self.on_canvas_motion)
         self.canvas.bind("<Leave>", self.on_canvas_leave)
         self.canvas.bind("<Configure>", self.on_canvas_configure)
@@ -195,60 +438,169 @@ class WebcamPatchApp:
             480,
             360,
             text="Waiting for video feed",
-            fill="#808080",
+            fill=UI_MUTED_TEXT,
             font=("Arial", 28, "bold"),
         )
 
         side = ttk.Frame(main, width=280)
         side.grid(row=0, column=1, sticky="ns")
         side.columnconfigure(0, weight=1)
-        side.rowconfigure(7, weight=1)
+        side.rowconfigure(4, weight=1)
 
-        ttk.Label(side, text="Controls", font=("", 12, "bold")).grid(
-            row=0, column=0, sticky="w", pady=(0, 10)
+        controls_label = ttk.Label(side, text="Controls", font=("", 12, "bold"))
+        controls_label.grid(row=0, column=0, sticky="w", pady=(0, 10))
+
+        patch_button_row = ttk.Frame(side)
+        patch_button_row.grid(row=1, column=0, sticky="ew", pady=2)
+        patch_button_row.columnconfigure(0, weight=1)
+        patch_button_row.columnconfigure(1, weight=1)
+        patch_button_row.columnconfigure(2, weight=1)
+
+        self.quad_button = ttk.Button(
+            patch_button_row,
+            text="Quadpatch",
+            command=self.start_quadpatch,
+            state=tk.DISABLED,
+            style=self.button_style_name,
         )
-
-        self.quad_button = ttk.Button(side, text="Quadpatch", command=self.start_quadpatch, state=tk.DISABLED)
-        self.quad_button.grid(row=1, column=0, sticky="ew", pady=2)
+        self.quad_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
 
         self.circle_button = ttk.Button(
-            side, text="Circlepatch", command=self.start_circlepatch, state=tk.DISABLED
+            patch_button_row,
+            text="Circlepatch",
+            command=self.start_circlepatch,
+            state=tk.DISABLED,
+            style=self.button_style_name,
         )
-        self.circle_button.grid(row=2, column=0, sticky="ew", pady=2)
+        self.circle_button.grid(row=0, column=1, sticky="ew", padx=2)
 
-        self.load_button = ttk.Button(side, text="Load", command=self.load_csv, state=tk.DISABLED)
-        self.load_button.grid(row=3, column=0, sticky="ew", pady=2)
+        self.poly_button = ttk.Button(
+            patch_button_row,
+            text="Polypatch",
+            command=self.start_polypatch,
+            state=tk.DISABLED,
+            style=self.button_style_name,
+        )
+        self.poly_button.grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
-        self.clear_button = ttk.Button(side, text="Clear", command=self.clear_all, state=tk.DISABLED)
-        self.clear_button.grid(row=4, column=0, sticky="ew", pady=2)
+        file_button_row = ttk.Frame(side)
+        file_button_row.grid(row=2, column=0, sticky="ew", pady=2)
+        file_button_row.columnconfigure(0, weight=1)
+        file_button_row.columnconfigure(1, weight=1)
 
-        self.reload_button = ttk.Button(side, text="Reload", command=self.reload_csv, state=tk.DISABLED)
-        self.reload_button.grid(row=5, column=0, sticky="ew", pady=2)
+        self.new_button = ttk.Button(
+            file_button_row,
+            text="New",
+            command=self.create_new_csv,
+            state=tk.DISABLED,
+            style=self.button_style_name,
+        )
+        self.new_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
 
-        self.new_button = ttk.Button(side, text="New", command=self.create_new_csv, state=tk.DISABLED)
-        self.new_button.grid(row=6, column=0, sticky="ew", pady=2)
+        self.clear_button = ttk.Button(
+            file_button_row,
+            text="Clear",
+            command=self.clear_all,
+            state=tk.DISABLED,
+            style=self.button_style_name,
+        )
+        self.clear_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+        load_button_row = ttk.Frame(side)
+        load_button_row.grid(row=3, column=0, sticky="ew", pady=2)
+        load_button_row.columnconfigure(0, weight=1)
+        load_button_row.columnconfigure(1, weight=1)
+
+        self.load_button = ttk.Button(
+            load_button_row,
+            text="Load",
+            command=self.load_csv,
+            state=tk.DISABLED,
+            style=self.button_style_name,
+        )
+        self.load_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+
+        self.reload_button = ttk.Button(
+            load_button_row,
+            text="Reload",
+            command=self.reload_csv,
+            state=tk.DISABLED,
+            style=self.button_style_name,
+        )
+        self.reload_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
         table_frame = ttk.LabelFrame(side, text="Patches", padding=8)
-        table_frame.grid(row=7, column=0, sticky="nsew", pady=(12, 0))
+        table_frame.grid(row=4, column=0, sticky="nsew", pady=(12, 0))
         table_frame.columnconfigure(0, weight=1)
         table_frame.rowconfigure(0, weight=1)
 
-        self.table = ttk.Treeview(table_frame, columns=("name", "type"), show="headings", height=18)
+        self.table = ttk.Treeview(
+            table_frame,
+            columns=("wall", "name", "type"),
+            show="headings",
+            height=18,
+            style=self.table_style_name,
+        )
+        self.table.heading("wall", text="Wall")
         self.table.heading("name", text="Name")
         self.table.heading("type", text="Type")
+        self.table.column("wall", width=52, anchor="center", stretch=False)
         self.table.column("name", width=150, anchor="w")
         self.table.column("type", width=100, anchor="w")
         self.table.grid(row=0, column=0, sticky="nsew")
+        self.table.bind("<<TreeviewSelect>>", self.on_table_select)
+        self.table.bind("<ButtonRelease-1>", self.on_table_click)
+        self.table.tag_configure("selected_patch_row", font=self.table_selected_font)
 
         scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.table.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.table.configure(yscrollcommand=scrollbar.set)
 
-        ttk.Label(side, textvariable=self.file_var, wraplength=250).grid(
-            row=8, column=0, sticky="ew", pady=(12, 4)
+        file_label = ttk.Label(side, textvariable=self.file_var, wraplength=250)
+        file_label.grid(row=5, column=0, sticky="ew", pady=(12, 4))
+        status_label = ttk.Label(side, textvariable=self.status_var, wraplength=250, justify="left")
+        status_label.grid(row=6, column=0, sticky="ew")
+
+        for widget in (
+            side,
+            controls_label,
+            patch_button_row,
+            file_button_row,
+            load_button_row,
+            table_frame,
+            file_label,
+            status_label,
+        ):
+            widget.bind("<ButtonPress-1>", self.on_sidebar_background_click, add="+")
+
+    def _configure_button_style(self, style: ttk.Style) -> None:
+        style.configure(
+            self.button_style_name,
+            foreground=UI_TEXT,
+            background=UI_PANEL_ALT_BG,
+            padding=(6, 2),
+            borderwidth=1,
+            focusthickness=0,
+            focuscolor=UI_ACCENT,
+            anchor="center",
+            relief="flat",
+            bordercolor=UI_BORDER,
+            lightcolor=UI_PANEL_ALT_BG,
+            darkcolor=UI_PANEL_ALT_BG,
         )
-        ttk.Label(side, textvariable=self.status_var, wraplength=250, justify="left").grid(
-            row=9, column=0, sticky="ew"
+        style.map(
+            self.button_style_name,
+            background=[
+                ("disabled", UI_BUTTON_DISABLED),
+                ("pressed", UI_ACCENT),
+                ("active", UI_ACCENT_ACTIVE),
+            ],
+            foreground=[("disabled", UI_BUTTON_DISABLED_TEXT), ("active", UI_BG), ("pressed", UI_BG)],
+            bordercolor=[
+                ("disabled", UI_BORDER),
+                ("pressed", UI_ACCENT),
+                ("active", UI_ACCENT_ACTIVE),
+            ],
         )
 
     def _open_camera(self) -> cv2.VideoCapture | None:
@@ -339,12 +691,16 @@ class WebcamPatchApp:
             temp_points = list(self.temp_points)
             mouse_position = self.mouse_position
             canvas_width, canvas_height = self.target_canvas_size
+            selected_patch_tag = self.selected_patch_tag
+            selected_vertex_index = self.selected_vertex_index
+            hovered_handle_key = self.hovered_handle_key
+            edit_drag_state = self.edit_drag_state
 
         display = frame_bgr.copy()
         height, width = display.shape[:2]
 
         for patch in patches:
-            if patch.kind == "quadpatch":
+            if patch.kind in {"quadpatch", "polypatch"}:
                 points = self._geometry_to_points(patch.geometry)
                 self.draw_translucent_polygon(display, points, patch.color_bgr, SAVED_FILL_ALPHA)
             elif patch.kind == "circlepatch":
@@ -356,6 +712,17 @@ class WebcamPatchApp:
                     patch.color_bgr,
                     SAVED_FILL_ALPHA,
                 )
+
+        selected_patch = next((patch for patch in patches if patch.table_tag == selected_patch_tag), None)
+        if selected_patch is not None:
+            self.draw_selected_patch(
+                display,
+                selected_patch,
+                selected_vertex_index,
+                hovered_handle_key,
+                edit_drag_state,
+                mouse_position,
+            )
 
         self.draw_preview(display, current_mode, temp_points, mouse_position)
 
@@ -371,6 +738,94 @@ class WebcamPatchApp:
         display_region = (offset_x, offset_y, display_width, display_height)
         display_rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
         return (display_rgb, display_region, (width, height))
+
+    def draw_selected_patch(
+        self,
+        frame_bgr: np.ndarray,
+        patch: PatchRecord,
+        selected_vertex_index: int | None,
+        hovered_handle_key: tuple[str, str, int | None] | None,
+        edit_drag_state: EditDragState | None,
+        mouse_position: tuple[int, int] | None,
+    ) -> None:
+        if patch.kind in {"quadpatch", "polypatch"}:
+            points = self._geometry_to_points(patch.geometry)
+            self.draw_translucent_polygon(
+                frame_bgr,
+                points,
+                SELECTED_OUTLINE_BGR,
+                SELECTED_FILL_ALPHA,
+                outline_bgr=patch.color_bgr,
+            )
+            for index, point in enumerate(points):
+                is_selected = patch.kind == "polypatch" and index == selected_vertex_index
+                handle_key = (patch.table_tag, "vertex", index)
+                is_hovered = hovered_handle_key == handle_key
+                self.draw_edit_handle(
+                    frame_bgr,
+                    point,
+                    patch.color_bgr,
+                    hovered=is_hovered,
+                    selected=is_selected,
+                )
+            return
+
+        if patch.kind == "circlepatch":
+            cx, cy, radius = patch.geometry
+            center = (int(round(cx)), int(round(cy)))
+            radius_int = int(round(radius))
+            center_selected = bool(
+                edit_drag_state is not None
+                and edit_drag_state.patch_tag == patch.table_tag
+                and edit_drag_state.drag_mode == "center"
+            )
+            radius_selected = bool(
+                edit_drag_state is not None
+                and edit_drag_state.patch_tag == patch.table_tag
+                and edit_drag_state.drag_mode == "radius"
+            )
+            radius_handle = self.get_circle_radius_handle(patch)
+            if radius_selected and mouse_position is not None:
+                radius_handle = mouse_position
+            self.draw_translucent_circle(
+                frame_bgr,
+                center,
+                radius_int,
+                SELECTED_OUTLINE_BGR,
+                SELECTED_FILL_ALPHA,
+                outline_bgr=patch.color_bgr,
+            )
+            self.draw_edit_handle(
+                frame_bgr,
+                center,
+                patch.color_bgr,
+                hovered=hovered_handle_key == (patch.table_tag, "center", None),
+                selected=center_selected,
+            )
+            self.draw_edit_handle(
+                frame_bgr,
+                radius_handle,
+                patch.color_bgr,
+                hovered=hovered_handle_key == (patch.table_tag, "radius", None),
+                selected=radius_selected,
+            )
+            if radius_selected:
+                cv2.line(frame_bgr, center, radius_handle, patch.color_bgr, 1, cv2.LINE_AA)
+
+    def draw_edit_handle(
+        self,
+        frame_bgr: np.ndarray,
+        point: tuple[int, int],
+        normal_bgr: tuple[int, int, int],
+        hovered: bool = False,
+        selected: bool = False,
+    ) -> None:
+        fill_color = complementary_bgr(normal_bgr) if selected else normal_bgr
+        radius = EDIT_HANDLE_RADIUS + HOVER_HANDLE_RADIUS_DELTA if hovered else EDIT_HANDLE_RADIUS
+        if selected:
+            radius += 1
+        cv2.circle(frame_bgr, point, radius, fill_color, thickness=-1, lineType=cv2.LINE_AA)
+        cv2.circle(frame_bgr, point, radius + 2, (0, 0, 0), thickness=1, lineType=cv2.LINE_AA)
 
     def show_frame(
         self,
@@ -410,6 +865,7 @@ class WebcamPatchApp:
             self.draw_crosshair(frame_bgr, center, PREVIEW_RED_BGR)
             if mouse_position is None:
                 return
+            self.draw_crosshair(frame_bgr, mouse_position, PREVIEW_RED_BGR)
             radius = int(round(distance_between(center, mouse_position)))
             self.draw_translucent_circle(
                 frame_bgr,
@@ -419,6 +875,36 @@ class WebcamPatchApp:
                 PREVIEW_RED_FILL_ALPHA,
                 outline_bgr=PREVIEW_RED_BGR,
             )
+        elif current_mode == "polypatch":
+            self.draw_polypatch_preview(frame_bgr, temp_points, mouse_position)
+
+    def draw_polypatch_preview(
+        self,
+        frame_bgr: np.ndarray,
+        temp_points: list[tuple[int, int]],
+        mouse_position: tuple[int, int] | None,
+    ) -> None:
+        if not temp_points:
+            return
+
+        for point in temp_points:
+            self.draw_crosshair(frame_bgr, point, PREVIEW_RED_BGR)
+
+        if mouse_position is None:
+            return
+
+        if len(temp_points) == 1:
+            cv2.line(frame_bgr, temp_points[0], mouse_position, PREVIEW_RED_BGR, 2, cv2.LINE_AA)
+            return
+
+        preview_points = temp_points + [mouse_position]
+        self.draw_translucent_polygon(
+            frame_bgr,
+            preview_points,
+            PREVIEW_RED_BGR,
+            PREVIEW_RED_FILL_ALPHA,
+            outline_bgr=PREVIEW_RED_BGR,
+        )
 
     def on_canvas_configure(self, event: tk.Event) -> None:
         with self.state_lock:
@@ -428,20 +914,85 @@ class WebcamPatchApp:
 
     def on_canvas_motion(self, event: tk.Event) -> None:
         point = self.clamp_point((event.x, event.y))
+        hovered_handle_key: tuple[str, str, int | None] | None = None
         with self.state_lock:
             self.mouse_position = point
+            current_mode = self.current_mode
+            edit_drag_state = self.edit_drag_state
+        if point is not None and current_mode is None and edit_drag_state is None:
+            handle = self.find_edit_handle_at_point(point)
+            if handle is not None:
+                patch, drag_mode, handle_index = handle
+                hovered_handle_key = (patch.table_tag, drag_mode, handle_index)
+        with self.state_lock:
+            self.hovered_handle_key = hovered_handle_key
 
     def on_canvas_leave(self, _event: tk.Event) -> None:
         with self.state_lock:
             self.mouse_position = None
+            self.hovered_handle_key = None
 
-    def on_canvas_click(self, event: tk.Event) -> None:
+    def on_canvas_press(self, event: tk.Event) -> None:
+        self.canvas.focus_set()
         point = self.clamp_point((event.x, event.y))
         with self.state_lock:
             current_mode = self.current_mode
-        if point is None or current_mode is None:
+        if current_mode is not None:
+            if point is not None:
+                if current_mode == "circlepatch":
+                    with self.state_lock:
+                        point_count = len(self.temp_points)
+                    if point_count == 0:
+                        self.handle_creation_click(current_mode, point)
+                    elif point_count == 1:
+                        with self.state_lock:
+                            self.mouse_position = point
+                            self.circle_creation_drag_active = True
+                    return
+                self.handle_creation_click(current_mode, point)
             return
 
+        if point is None:
+            self.select_patch(None)
+            return
+
+        handle = self.find_edit_handle_at_point(point)
+        if handle is not None:
+            patch, drag_mode, handle_index = handle
+            if not self.select_patch(patch.table_tag):
+                return
+            with self.state_lock:
+                self.selected_vertex_index = handle_index if patch.kind == "polypatch" else None
+            self.edit_drag_state = EditDragState(
+                patch_tag=patch.table_tag,
+                drag_mode=drag_mode,
+                start_point=point,
+                original_geometry=patch.geometry,
+                handle_index=handle_index,
+                original_circle_handle_angle=self.circle_handle_angles.get(patch.table_tag),
+            )
+            return
+
+        if self.try_insert_polypatch_vertex(event, point):
+            return
+
+        patch = self.find_patch_at_point(point)
+        if patch is None:
+            self.select_patch(None)
+            return
+
+        if not self.select_patch(patch.table_tag):
+            return
+        with self.state_lock:
+            self.selected_vertex_index = None
+        self.edit_drag_state = EditDragState(
+            patch_tag=patch.table_tag,
+            drag_mode="move",
+            start_point=point,
+            original_geometry=patch.geometry,
+        )
+
+    def handle_creation_click(self, current_mode: str, point: tuple[int, int]) -> None:
         if current_mode == "quadpatch":
             with self.state_lock:
                 self.temp_points.append(point)
@@ -450,10 +1001,171 @@ class WebcamPatchApp:
                 self.finish_quadpatch()
         elif current_mode == "circlepatch":
             with self.state_lock:
+                if self.temp_points:
+                    return
+                self.temp_points.append(point)
+            self.status_var.set("Circlepatch mode: drag to size the circle, then release to save.")
+        elif current_mode == "polypatch":
+            with self.state_lock:
                 self.temp_points.append(point)
                 point_count = len(self.temp_points)
-            if point_count == 2:
-                self.finish_circlepatch()
+            if point_count < 3:
+                self.status_var.set(
+                    f"Polypatch mode: {point_count} point(s) selected. Click another point."
+                )
+            else:
+                self.status_var.set(
+                    f"Polypatch mode: {point_count} point(s) selected. Press Enter to finish."
+                )
+
+    def on_canvas_drag(self, event: tk.Event) -> None:
+        point = self.clamp_point((event.x, event.y))
+        if point is None:
+            return
+
+        with self.state_lock:
+            self.mouse_position = point
+            current_mode = self.current_mode
+            circle_creation_drag_active = self.circle_creation_drag_active
+        if current_mode == "circlepatch" and circle_creation_drag_active:
+            return
+        drag_state = self.edit_drag_state
+        if drag_state is None:
+            return
+
+        patch = self.get_patch_by_tag(drag_state.patch_tag)
+        if patch is None:
+            self.edit_drag_state = None
+            return
+
+        candidate_geometry = self.get_drag_geometry_candidate(patch.kind, drag_state, point)
+        with self.state_lock:
+            patch.geometry = candidate_geometry
+            if patch.kind == "circlepatch" and drag_state.drag_mode == "radius":
+                self.circle_handle_angles[patch.table_tag] = self.calculate_circle_handle_angle(
+                    (candidate_geometry[0], candidate_geometry[1]),
+                    point,
+                )
+
+    def on_canvas_release(self, event: tk.Event) -> None:
+        point = self.clamp_point((event.x, event.y))
+        with self.state_lock:
+            current_mode = self.current_mode
+            circle_creation_drag_active = self.circle_creation_drag_active
+            temp_points = list(self.temp_points)
+        if current_mode == "circlepatch" and circle_creation_drag_active:
+            with self.state_lock:
+                self.circle_creation_drag_active = False
+            if point is None or len(temp_points) != 1:
+                return
+            center = temp_points[0]
+            if distance_between(center, point) <= 0:
+                self.status_var.set("Circlepatch mode: drag farther from the center to set the radius.")
+                return
+            with self.state_lock:
+                self.temp_points = [center, point]
+            self.finish_circlepatch()
+            return
+
+        drag_state = self.edit_drag_state
+        self.edit_drag_state = None
+        if drag_state is None:
+            return
+
+        patch = self.get_patch_by_tag(drag_state.patch_tag)
+        if patch is None:
+            return
+
+        if point is None:
+            with self.state_lock:
+                current_geometry = patch.geometry
+            if current_geometry != drag_state.original_geometry:
+                self.mark_selected_patch_dirty(patch.table_tag)
+            return
+
+        candidate_geometry = self.get_drag_geometry_candidate(patch.kind, drag_state, point)
+        with self.state_lock:
+            patch.geometry = candidate_geometry
+            if patch.kind == "circlepatch" and drag_state.drag_mode == "radius":
+                self.circle_handle_angles[patch.table_tag] = self.calculate_circle_handle_angle(
+                    (candidate_geometry[0], candidate_geometry[1]),
+                    point,
+                )
+        if candidate_geometry != drag_state.original_geometry:
+            self.mark_selected_patch_dirty(patch.table_tag)
+
+    def on_return_key(self, _event: tk.Event) -> None:
+        with self.state_lock:
+            current_mode = self.current_mode
+            point_count = len(self.temp_points)
+
+        if current_mode != "polypatch":
+            return
+
+        if point_count < 3:
+            messagebox.showwarning(
+                "Incomplete Polypatch",
+                "A polypatch needs at least 3 points before it can be saved.",
+                parent=self.root,
+            )
+            return
+
+        self.finish_polypatch()
+
+    def on_escape_key(self, _event: tk.Event) -> None:
+        with self.state_lock:
+            current_mode = self.current_mode
+
+        if current_mode is not None:
+            self.cancel_current_mode(current_mode)
+            return
+
+        drag_state = self.edit_drag_state
+        if drag_state is None:
+            return
+
+        patch = self.get_patch_by_tag(drag_state.patch_tag)
+        if patch is not None:
+            with self.state_lock:
+                patch.geometry = drag_state.original_geometry
+                if patch.kind == "circlepatch" and drag_state.original_circle_handle_angle is not None:
+                    self.circle_handle_angles[patch.table_tag] = drag_state.original_circle_handle_angle
+        self.edit_drag_state = None
+        self.status_var.set("Edit cancelled.")
+
+    def on_delete_key(self, _event: tk.Event) -> None:
+        focus_widget = self.root.focus_get()
+        if focus_widget is not None and focus_widget.winfo_class() in {"Entry", "TEntry", "Text", "Spinbox", "TCombobox"}:
+            return
+
+        with self.state_lock:
+            current_mode = self.current_mode
+            selected_patch_tag = self.selected_patch_tag
+            selected_vertex_index = self.selected_vertex_index
+
+        if current_mode is not None or selected_patch_tag is None or selected_vertex_index is None:
+            return
+
+        patch = self.get_patch_by_tag(selected_patch_tag)
+        if patch is None or patch.kind != "polypatch":
+            return
+
+        points = self._geometry_to_points(patch.geometry)
+        if len(points) <= 3:
+            messagebox.showwarning(
+                "Cannot Delete Vertex",
+                "A polypatch must keep at least 3 points.",
+                parent=self.root,
+            )
+            return
+
+        candidate_points = points[:selected_vertex_index] + points[selected_vertex_index + 1 :]
+        candidate_geometry = tuple(float(value) for vertex in candidate_points for value in vertex)
+        with self.state_lock:
+            patch.geometry = candidate_geometry
+            self.selected_vertex_index = min(selected_vertex_index, len(candidate_points) - 1)
+        self.mark_selected_patch_dirty(patch.table_tag)
+        self.status_var.set(f'Removed a vertex from "{patch.name}".')
 
     def clamp_point(self, point: tuple[int, int]) -> tuple[int, int] | None:
         if self.frame_size is None or self.display_region is None:
@@ -519,8 +1231,9 @@ class WebcamPatchApp:
         with self.state_lock:
             self.current_mode = "circlepatch"
             self.temp_points = []
+            self.circle_creation_drag_active = False
             self.mouse_position = None
-        self.status_var.set("Circlepatch mode: click the center, then click the edge.")
+        self.status_var.set("Circlepatch mode: click the center, then drag to set the radius.")
 
     def finish_circlepatch(self) -> None:
         with self.state_lock:
@@ -544,19 +1257,463 @@ class WebcamPatchApp:
         with self.state_lock:
             self.temp_points = []
         geometry = (float(center[0]), float(center[1]), float(radius))
-        self.save_patch_record(name=name, kind="circlepatch", geometry=geometry)
+        self.save_patch_record(
+            name=name,
+            kind="circlepatch",
+            geometry=geometry,
+            circle_handle_angle=self.calculate_circle_handle_angle(center, edge),
+        )
         self.status_var.set(f'Saved circlepatch "{name}".')
+
+    def start_polypatch(self) -> None:
+        if self.current_csv_path is None:
+            return
+        with self.state_lock:
+            self.current_mode = "polypatch"
+            self.temp_points = []
+            self.mouse_position = None
+        self.status_var.set("Polypatch mode: click points around the polygon. Press Enter to finish.")
+
+    def finish_polypatch(self) -> None:
+        with self.state_lock:
+            raw_points = list(self.temp_points)
+            self.current_mode = None
+            self.mouse_position = None
+
+        if not is_convex_polygon(raw_points):
+            messagebox.showerror(
+                "Invalid Polypatch",
+                "The selected shape is not a convex polygon. The polypatch was cancelled.",
+                parent=self.root,
+            )
+            with self.state_lock:
+                self.temp_points = []
+            self.status_var.set("Polypatch cancelled.")
+            return
+
+        name = self.prompt_for_name("Save Polypatch", "Enter a name for this polypatch:")
+        if name is None:
+            with self.state_lock:
+                self.temp_points = []
+            self.status_var.set("Polypatch cancelled.")
+            return
+
+        with self.state_lock:
+            self.temp_points = []
+        geometry = tuple(float(value) for point in raw_points for value in point)
+        self.save_patch_record(name=name, kind="polypatch", geometry=geometry)
+        self.status_var.set(f'Saved polypatch "{name}".')
+
+    def cancel_current_mode(self, current_mode: str) -> None:
+        with self.state_lock:
+            self.current_mode = None
+            self.temp_points = []
+            self.circle_creation_drag_active = False
+            self.mouse_position = None
+
+        if current_mode == "quadpatch":
+            self.status_var.set("Quadpatch cancelled.")
+        elif current_mode == "circlepatch":
+            self.status_var.set("Circlepatch cancelled.")
+        elif current_mode == "polypatch":
+            self.status_var.set("Polypatch cancelled.")
+
+    def get_patch_by_tag(self, table_tag: str) -> PatchRecord | None:
+        with self.state_lock:
+            return next((patch for patch in self.patches if patch.table_tag == table_tag), None)
+
+    def select_patch(self, table_tag: str | None) -> None:
+        with self.state_lock:
+            current_tag = self.selected_patch_tag
+
+        if table_tag == current_tag:
+            self.apply_table_selection(table_tag)
+            self.refresh_table_selection_styles()
+            return True
+
+        if not self.finalize_selected_patch_on_deselect():
+            self.apply_table_selection(current_tag)
+            self.refresh_table_selection_styles()
+            return False
+
+        self.start_selected_patch_session(table_tag)
+        self.apply_table_selection(table_tag)
+        self.refresh_table_selection_styles()
+        return True
+
+    def on_table_select(self, _event: tk.Event) -> None:
+        if self.ignore_table_select_event:
+            return
+
+        selection = self.table.selection()
+        new_patch_tag = selection[0] if selection else None
+        self.select_patch(new_patch_tag)
+
+    def on_sidebar_background_click(self, event: tk.Event) -> None:
+        with self.state_lock:
+            current_mode = self.current_mode
+        if current_mode is not None:
+            return
+        if event.widget is self.table:
+            return
+        self.select_patch(None)
+
+    def refresh_table_selection_styles(self) -> None:
+        selection = set(self.table.selection())
+        for item_id in self.table.get_children():
+            base_tags = [item_id]
+            if item_id in selection:
+                base_tags.append("selected_patch_row")
+            self.table.item(item_id, tags=tuple(base_tags))
+
+    def apply_table_selection(self, table_tag: str | None) -> None:
+        self.ignore_table_select_event = True
+        try:
+            if table_tag is None:
+                self.table.selection_remove(self.table.selection())
+                return
+            if self.table.exists(table_tag):
+                self.table.selection_set((table_tag,))
+                self.table.focus(table_tag)
+                self.table.see(table_tag)
+        finally:
+            self.root.after_idle(self.clear_ignore_table_select_event)
+
+    def clear_ignore_table_select_event(self) -> None:
+        self.ignore_table_select_event = False
+
+    def start_selected_patch_session(self, table_tag: str | None) -> None:
+        patch_geometry: tuple[float, ...] | None = None
+        wall_adjacent: bool | None = None
+        circle_handle_angle: float | None = None
+        if table_tag is not None:
+            patch = self.get_patch_by_tag(table_tag)
+            if patch is not None:
+                patch_geometry = tuple(patch.geometry)
+                wall_adjacent = patch.wall_adjacent
+                circle_handle_angle = self.circle_handle_angles.get(table_tag)
+
+        with self.state_lock:
+            self.selected_patch_tag = table_tag
+            self.selected_patch_original_geometry = patch_geometry
+            self.selected_patch_original_wall_adjacent = wall_adjacent
+            self.selected_patch_original_circle_handle_angle = circle_handle_angle
+            self.selected_patch_has_unsaved_changes = False
+            self.selected_vertex_index = None
+            self.hovered_handle_key = None
+
+    def mark_selected_patch_dirty(self, table_tag: str | None) -> None:
+        with self.state_lock:
+            if self.selected_patch_tag == table_tag:
+                self.selected_patch_has_unsaved_changes = True
+
+    def prompt_invalid_patch_choice(self, patch_name: str, reason: str) -> str:
+        dialog = InvalidPatchDialog(self.root, patch_name, reason)
+        self.root.wait_window(dialog)
+        return dialog.result
+
+    def finalize_selected_patch_on_deselect(self) -> bool:
+        with self.state_lock:
+            selected_tag = self.selected_patch_tag
+            original_geometry = self.selected_patch_original_geometry
+            original_wall_adjacent = self.selected_patch_original_wall_adjacent
+            original_circle_handle_angle = self.selected_patch_original_circle_handle_angle
+            has_unsaved_changes = self.selected_patch_has_unsaved_changes
+
+        if selected_tag is None or original_geometry is None or not has_unsaved_changes:
+            return True
+
+        patch = self.get_patch_by_tag(selected_tag)
+        if patch is None:
+            return True
+
+        invalid_reason = self.invalid_geometry_reason(patch.kind, patch.geometry)
+        if invalid_reason is None:
+            if not self.write_all_patches_to_csv():
+                return False
+            self.status_var.set(f'Saved changes to "{patch.name}".')
+            return True
+
+        choice = self.prompt_invalid_patch_choice(patch.name, invalid_reason)
+        if choice == "edit":
+            self.status_var.set(f'Continue editing "{patch.name}" before deselecting it.')
+            return False
+
+        with self.state_lock:
+            patch.geometry = original_geometry
+            if original_wall_adjacent is not None:
+                patch.wall_adjacent = original_wall_adjacent
+            if patch.kind == "circlepatch":
+                self.circle_handle_angles[patch.table_tag] = (
+                    0.0 if original_circle_handle_angle is None else original_circle_handle_angle
+                )
+            self.selected_patch_has_unsaved_changes = False
+        self.update_table_row(patch)
+        self.status_var.set(f'Discarded unsaved changes to "{patch.name}".')
+        return True
+
+    def finalize_selected_patch_for_close(self) -> None:
+        with self.state_lock:
+            selected_tag = self.selected_patch_tag
+            original_geometry = self.selected_patch_original_geometry
+            original_wall_adjacent = self.selected_patch_original_wall_adjacent
+            original_circle_handle_angle = self.selected_patch_original_circle_handle_angle
+            has_unsaved_changes = self.selected_patch_has_unsaved_changes
+
+        if selected_tag is None:
+            return
+
+        patch = self.get_patch_by_tag(selected_tag)
+        if patch is None:
+            return
+
+        if has_unsaved_changes and original_geometry is not None:
+            invalid_reason = self.invalid_geometry_reason(patch.kind, patch.geometry)
+            if invalid_reason is None:
+                try:
+                    with self.state_lock:
+                        rows = [self.serialize_record(record) for record in self.patches]
+                    if self.current_csv_path is not None:
+                        with self.current_csv_path.open("w", newline="", encoding="utf-8") as handle:
+                            writer = csv.writer(handle)
+                            writer.writerows(rows)
+                except OSError:
+                    pass
+            else:
+                with self.state_lock:
+                    patch.geometry = original_geometry
+                    if original_wall_adjacent is not None:
+                        patch.wall_adjacent = original_wall_adjacent
+                    if patch.kind == "circlepatch":
+                        self.circle_handle_angles[patch.table_tag] = (
+                            0.0 if original_circle_handle_angle is None else original_circle_handle_angle
+                        )
+
+        with self.state_lock:
+            self.selected_patch_tag = None
+            self.selected_patch_original_geometry = None
+            self.selected_patch_original_wall_adjacent = None
+            self.selected_patch_original_circle_handle_angle = None
+            self.selected_patch_has_unsaved_changes = False
+            self.selected_vertex_index = None
+            self.hovered_handle_key = None
+        self.apply_table_selection(None)
+        self.refresh_table_selection_styles()
+
+    def on_table_click(self, event: tk.Event) -> None:
+        region = self.table.identify_region(event.x, event.y)
+        row_id = self.table.identify_row(event.y)
+        if not row_id:
+            if region != "heading":
+                self.select_patch(None)
+            return
+
+        if region != "cell":
+            return
+
+        column_id = self.table.identify_column(event.x)
+        if column_id != "#1":
+            return
+
+        if not self.select_patch(row_id):
+            return
+
+        patch = self.get_patch_by_tag(row_id)
+        if patch is None:
+            return
+
+        patch.wall_adjacent = not patch.wall_adjacent
+        self.update_table_row(patch)
+        self.mark_selected_patch_dirty(patch.table_tag)
+        if self.selected_patch_tag != patch.table_tag:
+            if not self.write_all_patches_to_csv():
+                patch.wall_adjacent = not patch.wall_adjacent
+                self.update_table_row(patch)
+                return
+        state_text = "enabled" if patch.wall_adjacent else "cleared"
+        self.status_var.set(f'Wall-adjacent flag {state_text} for "{patch.name}".')
+
+    def find_patch_at_point(self, point: tuple[int, int]) -> PatchRecord | None:
+        with self.state_lock:
+            patches = list(self.patches)
+
+        for patch in reversed(patches):
+            if self.patch_contains_point(patch, point):
+                return patch
+        return None
+
+    def patch_contains_point(self, patch: PatchRecord, point: tuple[int, int]) -> bool:
+        if patch.kind == "circlepatch":
+            cx, cy, radius = patch.geometry
+            return distance_between((int(round(cx)), int(round(cy))), point) <= radius
+
+        points = np.array(self._geometry_to_points(patch.geometry), dtype=np.int32)
+        return cv2.pointPolygonTest(points, point, False) >= 0
+
+    def find_edit_handle_at_point(
+        self, point: tuple[int, int]
+    ) -> tuple[PatchRecord, str, int | None] | None:
+        if self.selected_patch_tag is None:
+            return None
+
+        patch = self.get_patch_by_tag(self.selected_patch_tag)
+        if patch is None:
+            return None
+
+        if patch.kind == "circlepatch":
+            center = (int(round(patch.geometry[0])), int(round(patch.geometry[1])))
+            radius_handle = self.get_circle_radius_handle(patch)
+            if distance_between(center, point) <= EDIT_HIT_RADIUS:
+                return (patch, "center", None)
+            if distance_between(radius_handle, point) <= EDIT_HIT_RADIUS:
+                return (patch, "radius", None)
+            return None
+
+        for index, vertex in enumerate(self._geometry_to_points(patch.geometry)):
+            if distance_between(vertex, point) <= EDIT_HIT_RADIUS:
+                return (patch, "vertex", index)
+        return None
+
+    def get_circle_radius_handle(self, patch: PatchRecord) -> tuple[int, int]:
+        cx, cy, radius = patch.geometry
+        angle = self.circle_handle_angles.get(patch.table_tag, 0.0)
+        return (
+            int(round(cx + (radius * math.cos(angle)))),
+            int(round(cy + (radius * math.sin(angle)))),
+        )
+
+    def calculate_circle_handle_angle(
+        self, center: tuple[float, float] | tuple[int, int], point: tuple[int, int]
+    ) -> float:
+        return math.atan2(point[1] - center[1], point[0] - center[0])
+
+    def try_insert_polypatch_vertex(self, event: tk.Event, point: tuple[int, int]) -> bool:
+        if not event.state & SHIFT_MASK:
+            return False
+
+        with self.state_lock:
+            selected_patch_tag = self.selected_patch_tag
+
+        if selected_patch_tag is None:
+            return False
+
+        patch = self.get_patch_by_tag(selected_patch_tag)
+        if patch is None or patch.kind != "polypatch":
+            return False
+
+        insert_index = self.find_polypatch_edge_insert_index(patch, point)
+        if insert_index is None:
+            return False
+
+        points = self._geometry_to_points(patch.geometry)
+        candidate_points = points[:insert_index] + [point] + points[insert_index:]
+        candidate_geometry = tuple(float(value) for vertex in candidate_points for value in vertex)
+        with self.state_lock:
+            patch.geometry = candidate_geometry
+            self.selected_vertex_index = insert_index
+        self.mark_selected_patch_dirty(patch.table_tag)
+        self.status_var.set(f'Added a vertex to "{patch.name}".')
+        return True
+
+    def find_polypatch_edge_insert_index(self, patch: PatchRecord, point: tuple[int, int]) -> int | None:
+        points = self._geometry_to_points(patch.geometry)
+        best_index: int | None = None
+        best_distance = float("inf")
+
+        for index, start in enumerate(points):
+            end = points[(index + 1) % len(points)]
+            distance = point_to_segment_distance(point, start, end)
+            if distance <= EDGE_HIT_DISTANCE and distance < best_distance:
+                best_distance = distance
+                best_index = index + 1
+
+        return best_index
+
+    def get_drag_geometry_candidate(
+        self, kind: str, drag_state: EditDragState, point: tuple[int, int]
+    ) -> tuple[float, ...]:
+        if drag_state.drag_mode == "move":
+            dx = point[0] - drag_state.start_point[0]
+            dy = point[1] - drag_state.start_point[1]
+            original = drag_state.original_geometry
+            if kind == "circlepatch":
+                return (original[0] + dx, original[1] + dy, original[2])
+            moved: list[float] = []
+            for index, value in enumerate(original):
+                moved.append(value + (dx if index % 2 == 0 else dy))
+            return tuple(moved)
+
+        if kind == "circlepatch":
+            cx, cy, radius = drag_state.original_geometry
+            if drag_state.drag_mode == "center":
+                return (float(point[0]), float(point[1]), radius)
+            if drag_state.drag_mode == "radius":
+                return (cx, cy, float(distance_between((int(round(cx)), int(round(cy))), point)))
+
+        if drag_state.drag_mode == "vertex" and drag_state.handle_index is not None:
+            points = self._geometry_to_points(drag_state.original_geometry)
+            points[drag_state.handle_index] = point
+            return tuple(float(value) for vertex in points for value in vertex)
+
+        return drag_state.original_geometry
+
+    def invalid_geometry_reason(self, kind: str, geometry: tuple[float, ...]) -> str | None:
+        if kind == "circlepatch":
+            if len(geometry) != 3:
+                return "circlepatches need center x, center y, and radius."
+            if geometry[2] <= 0:
+                return "the radius must be greater than 0."
+            return None
+
+        points = self._geometry_to_points(geometry)
+        if kind == "quadpatch":
+            return polygon_invalid_reason(points, minimum_points=4, required_points=4)
+        if kind == "polypatch":
+            return polygon_invalid_reason(points, minimum_points=3)
+        return "unsupported patch type."
+
+    def is_valid_geometry(self, kind: str, geometry: tuple[float, ...]) -> bool:
+        return self.invalid_geometry_reason(kind, geometry) is None
+
+    def write_all_patches_to_csv(self) -> bool:
+        if self.current_csv_path is None:
+            raise RuntimeError("No CSV file is active.")
+
+        with self.state_lock:
+            rows = [self.serialize_record(patch) for patch in self.patches]
+
+        try:
+            with self.current_csv_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerows(rows)
+        except OSError as exc:
+            messagebox.showerror(
+                "Save Error",
+                f"Could not write the updated patch data.\n\n{exc}",
+                parent=self.root,
+            )
+            return False
+
+        return True
 
     def prompt_for_name(self, title: str, prompt: str) -> str | None:
         dialog = NamePrompt(self.root, title, prompt)
         self.root.wait_window(dialog)
         return dialog.result
 
-    def save_patch_record(self, name: str, kind: str, geometry: tuple[float, ...]) -> None:
+    def save_patch_record(
+        self,
+        name: str,
+        kind: str,
+        geometry: tuple[float, ...],
+        circle_handle_angle: float | None = None,
+    ) -> None:
         if self.current_csv_path is None:
             raise RuntimeError("No CSV file is active.")
 
         record = self.make_patch_record(name, kind, geometry)
+        if kind == "circlepatch":
+            self.circle_handle_angles[record.table_tag] = 0.0 if circle_handle_angle is None else circle_handle_angle
         try:
             with self.current_csv_path.open("a", newline="", encoding="utf-8") as handle:
                 writer = csv.writer(handle)
@@ -568,13 +1725,18 @@ class WebcamPatchApp:
         self.add_patch_to_ui(record)
 
     def serialize_record(self, record: PatchRecord) -> list[str]:
+        metadata = [f"wall_adjacent={'true' if record.wall_adjacent else 'false'}"]
         if record.kind == "quadpatch":
-            return [record.kind, record.name, *[format_number(value) for value in record.geometry]]
+            return [record.kind, record.name, *metadata, *[format_number(value) for value in record.geometry]]
         if record.kind == "circlepatch":
-            return [record.kind, record.name, *[format_number(value) for value in record.geometry]]
+            return [record.kind, record.name, *metadata, *[format_number(value) for value in record.geometry]]
+        if record.kind == "polypatch":
+            return [record.kind, record.name, *metadata, *[format_number(value) for value in record.geometry]]
         raise ValueError(f"Unsupported patch type: {record.kind}")
 
-    def make_patch_record(self, name: str, kind: str, geometry: tuple[float, ...]) -> PatchRecord:
+    def make_patch_record(
+        self, name: str, kind: str, geometry: tuple[float, ...], wall_adjacent: bool = False
+    ) -> PatchRecord:
         self.tag_counter += 1
         return PatchRecord(
             name=name,
@@ -582,6 +1744,7 @@ class WebcamPatchApp:
             geometry=geometry,
             color_rgb=self.generate_patch_color(),
             table_tag=f"patch_{self.tag_counter}",
+            wall_adjacent=wall_adjacent,
         )
 
     def generate_patch_color(self) -> tuple[int, int, int]:
@@ -599,14 +1762,32 @@ class WebcamPatchApp:
     def add_patch_to_ui(self, record: PatchRecord) -> None:
         with self.state_lock:
             self.patches.append(record)
+            if record.kind == "circlepatch" and record.table_tag not in self.circle_handle_angles:
+                self.circle_handle_angles[record.table_tag] = 0.0
         self.table.tag_configure(
             record.table_tag,
             background=record.outline_hex,
             foreground=record.text_hex,
         )
-        self.table.insert("", tk.END, values=(record.name, record.kind), tags=(record.table_tag,))
+        self.table.insert(
+            "",
+            tk.END,
+            iid=record.table_tag,
+            values=self.table_row_values(record),
+            tags=(record.table_tag,),
+        )
+        self.select_patch(record.table_tag)
+
+    def update_table_row(self, record: PatchRecord) -> None:
+        if self.table.exists(record.table_tag):
+            self.table.item(record.table_tag, values=self.table_row_values(record))
+
+    def table_row_values(self, record: PatchRecord) -> tuple[str, str, str]:
+        return (checkbox_text(record.wall_adjacent), record.name, record.kind)
 
     def load_csv(self) -> None:
+        if not self.finalize_selected_patch_on_deselect():
+            return
         path_text = filedialog.askopenfilename(
             parent=self.root,
             title="Load Patch CSV",
@@ -628,7 +1809,7 @@ class WebcamPatchApp:
                 "Some rows could not be loaded:\n\n" + "\n".join(errors[:10]),
                 parent=self.root,
             )
-        self.status_var.set(f"Loaded {len(self.patches)} patch(es) from {path.name}.")
+        self.status_var.set(f"Loaded {len(self.patches)} patch(es) from {path.name}. Click a patch to edit it.")
         self.update_button_states()
 
     def load_records_from_file(self, path: Path) -> list[str]:
@@ -643,8 +1824,8 @@ class WebcamPatchApp:
                         parsed = parse_csv_row(row)
                         if parsed is None:
                             continue
-                        name, kind, geometry = parsed
-                        record = self.make_patch_record(name, kind, geometry)
+                        name, kind, geometry, wall_adjacent = parsed
+                        record = self.make_patch_record(name, kind, geometry, wall_adjacent=wall_adjacent)
                         self.add_patch_to_ui(record)
                     except ValueError as exc:
                         errors.append(f"Line {line_number}: {exc}")
@@ -654,6 +1835,8 @@ class WebcamPatchApp:
         return errors
 
     def reload_csv(self) -> None:
+        if not self.finalize_selected_patch_on_deselect():
+            return
         if self.current_csv_path is None:
             return
         path = self.current_csv_path
@@ -678,10 +1861,12 @@ class WebcamPatchApp:
                 "Some rows could not be loaded:\n\n" + "\n".join(errors[:10]),
                 parent=self.root,
             )
-        self.status_var.set(f"Reloaded {len(self.patches)} patch(es) from {path.name}.")
+        self.status_var.set(f"Reloaded {len(self.patches)} patch(es) from {path.name}. Click a patch to edit it.")
         self.update_button_states()
 
     def create_new_csv(self) -> None:
+        if not self.finalize_selected_patch_on_deselect():
+            return
         path_text = filedialog.asksaveasfilename(
             parent=self.root,
             title="Create Patch CSV",
@@ -723,7 +1908,7 @@ class WebcamPatchApp:
         self.current_csv_path = path
         self.file_var.set(f"CSV: {path}")
         self.update_button_states()
-        self.status_var.set(f"Created new CSV file: {path.name}")
+        self.status_var.set(f"Created new CSV file: {path.name}. Add or edit patches in the display.")
 
     def resolve_new_csv_path(self, selected_path: Path) -> Path:
         target_dir = selected_path.parent
@@ -734,6 +1919,8 @@ class WebcamPatchApp:
         return target_dir / selected_path.name
 
     def clear_all(self) -> None:
+        if not self.finalize_selected_patch_on_deselect():
+            return
         self.clear_patch_data(reset_file=True)
         self.status_var.set("Cleared patches and reset the active CSV file.")
         self.update_button_states()
@@ -742,8 +1929,18 @@ class WebcamPatchApp:
         with self.state_lock:
             self.current_mode = None
             self.temp_points = []
+            self.circle_creation_drag_active = False
             self.mouse_position = None
             self.display_region = None
+            self.selected_patch_tag = None
+            self.selected_patch_original_geometry = None
+            self.selected_patch_original_wall_adjacent = None
+            self.selected_patch_original_circle_handle_angle = None
+            self.selected_patch_has_unsaved_changes = False
+            self.selected_vertex_index = None
+            self.hovered_handle_key = None
+            self.edit_drag_state = None
+            self.circle_handle_angles.clear()
             self.patches.clear()
             self.latest_display_rgb = None
             self.latest_display_region = None
@@ -762,6 +1959,7 @@ class WebcamPatchApp:
             self.new_button.config(state=tk.DISABLED)
             self.quad_button.config(state=tk.DISABLED)
             self.circle_button.config(state=tk.DISABLED)
+            self.poly_button.config(state=tk.DISABLED)
             self.reload_button.config(state=tk.DISABLED)
             return
 
@@ -772,6 +1970,7 @@ class WebcamPatchApp:
         patch_state = tk.NORMAL if self.current_csv_path is not None else tk.DISABLED
         self.quad_button.config(state=patch_state)
         self.circle_button.config(state=patch_state)
+        self.poly_button.config(state=patch_state)
         self.reload_button.config(state=patch_state)
 
     def hide_waiting_overlay(self) -> None:
@@ -841,9 +2040,18 @@ class WebcamPatchApp:
         ]
 
     def on_close(self) -> None:
+        self.finalize_selected_patch_for_close()
         self.stop_event.set()
         if self.render_thread is not None and self.render_thread.is_alive():
             self.render_thread.join(timeout=1.0)
+        if self.instance_listener_socket is not None:
+            try:
+                self.instance_listener_socket.close()
+            except OSError:
+                pass
+            self.instance_listener_socket = None
+        if self.instance_listener_thread is not None and self.instance_listener_thread.is_alive():
+            self.instance_listener_thread.join(timeout=1.0)
         if hasattr(self, "capture") and self.capture is not None:
             self.capture.release()
         self.root.destroy()
@@ -851,6 +2059,98 @@ class WebcamPatchApp:
 
 def distance_between(point_a: tuple[int, int], point_b: tuple[int, int]) -> float:
     return math.hypot(point_b[0] - point_a[0], point_b[1] - point_a[1])
+
+
+def point_to_segment_distance(
+    point: tuple[int, int], segment_start: tuple[int, int], segment_end: tuple[int, int]
+) -> float:
+    px, py = point
+    x1, y1 = segment_start
+    x2, y2 = segment_end
+    dx = x2 - x1
+    dy = y2 - y1
+    if dx == 0 and dy == 0:
+        return distance_between(point, segment_start)
+
+    projection = ((px - x1) * dx + (py - y1) * dy) / float(dx * dx + dy * dy)
+    projection = max(0.0, min(1.0, projection))
+    closest_x = x1 + projection * dx
+    closest_y = y1 + projection * dy
+    return math.hypot(px - closest_x, py - closest_y)
+
+
+def complementary_bgr(color_bgr: tuple[int, int, int]) -> tuple[int, int, int]:
+    blue, green, red = color_bgr
+    red_norm = red / 255.0
+    green_norm = green / 255.0
+    blue_norm = blue / 255.0
+
+    hue, saturation, value = colorsys.rgb_to_hsv(red_norm, green_norm, blue_norm)
+    complementary_hue = (hue + 0.5) % 1.0
+    comp_red, comp_green, comp_blue = colorsys.hsv_to_rgb(complementary_hue, saturation, value)
+    return (
+        int(round(comp_blue * 255)),
+        int(round(comp_green * 255)),
+        int(round(comp_red * 255)),
+    )
+
+
+def checkbox_text(is_checked: bool) -> str:
+    return "[x]" if is_checked else "[ ]"
+
+
+def hide_console_window() -> None:
+    if sys.platform != "win32":
+        return
+
+    try:
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)
+    except Exception:
+        return
+
+
+def configure_windows_app_id() -> None:
+    if sys.platform != "win32":
+        return
+
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(WINDOWS_APP_ID)
+    except Exception:
+        return
+
+
+def request_existing_instance_shutdown() -> None:
+    try:
+        with socket.create_connection((INSTANCE_HOST, INSTANCE_PORT), timeout=0.5) as connection:
+            connection.sendall(INSTANCE_SHUTDOWN_MESSAGE)
+    except OSError:
+        return
+
+
+def acquire_instance_listener() -> socket.socket:
+    deadline = time.time() + INSTANCE_STARTUP_TIMEOUT_S
+    first_attempt = True
+
+    while True:
+        listener_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                listener_socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                listener_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener_socket.bind((INSTANCE_HOST, INSTANCE_PORT))
+            listener_socket.listen(1)
+            listener_socket.settimeout(0.5)
+            return listener_socket
+        except OSError:
+            listener_socket.close()
+            request_existing_instance_shutdown()
+            if not first_attempt and time.time() >= deadline:
+                raise RuntimeError("Could not close the previous Patch Generator instance.")
+            first_attempt = False
+            time.sleep(0.2)
 
 
 def ideal_text_color(color_rgb: tuple[int, int, int]) -> str:
@@ -883,27 +2183,44 @@ def order_quad_points(points: list[tuple[int, int]]) -> list[tuple[int, int]] | 
 
 
 def is_convex_quad(points: list[tuple[int, int]]) -> bool:
-    if len(points) != 4:
-        return False
+    return len(points) == 4 and is_convex_polygon(points)
+
+
+def is_convex_polygon(points: list[tuple[int, int]]) -> bool:
+    return polygon_invalid_reason(points) is None
+
+
+def polygon_invalid_reason(
+    points: list[tuple[int, int]], minimum_points: int = 3, required_points: int | None = None
+) -> str | None:
+    if required_points is not None and len(points) != required_points:
+        return f"it needs exactly {required_points} points."
+    if len(points) < 3 or len(set(points)) != len(points):
+        if len(points) < minimum_points:
+            return f"it needs at least {minimum_points} points."
+        return "two or more points overlap."
 
     cross_products: list[float] = []
-    for index in range(4):
+    point_count = len(points)
+    for index in range(point_count):
         p1 = points[index]
-        p2 = points[(index + 1) % 4]
-        p3 = points[(index + 2) % 4]
+        p2 = points[(index + 1) % point_count]
+        p3 = points[(index + 2) % point_count]
         vector_a = (p2[0] - p1[0], p2[1] - p1[1])
         vector_b = (p3[0] - p2[0], p3[1] - p2[1])
         cross = vector_a[0] * vector_b[1] - vector_a[1] * vector_b[0]
         if abs(cross) < 1e-6:
-            return False
+            return "at least three neighboring points are collinear."
         cross_products.append(cross)
 
     has_positive = any(value > 0 for value in cross_products)
     has_negative = any(value < 0 for value in cross_products)
-    return not (has_positive and has_negative)
+    if has_positive and has_negative:
+        return "the polygon is concave."
+    return None
 
 
-def parse_csv_row(row: list[str]) -> tuple[str, str, tuple[float, ...]] | None:
+def parse_csv_row(row: list[str]) -> tuple[str, str, tuple[float, ...], bool] | None:
     cells = [cell.strip() for cell in row if cell.strip()]
     if not cells:
         return None
@@ -916,6 +2233,8 @@ def parse_csv_row(row: list[str]) -> tuple[str, str, tuple[float, ...]] | None:
         kind = "quadpatch"
     elif "circlepatch" in first_two:
         kind = "circlepatch"
+    elif "polypatch" in first_two:
+        kind = "polypatch"
     else:
         raise ValueError("Row does not contain a supported patch label.")
 
@@ -924,10 +2243,25 @@ def parse_csv_row(row: list[str]) -> tuple[str, str, tuple[float, ...]] | None:
 
     if cells[0].lower() == kind:
         name = cells[1]
-        number_cells = cells[2:]
+        remainder_cells = cells[2:]
     else:
         name = cells[0]
-        number_cells = cells[2:]
+        remainder_cells = cells[2:]
+
+    wall_adjacent = False
+    number_cells: list[str] = []
+    for cell in remainder_cells:
+        lowered = cell.lower()
+        if lowered.startswith("wall_adjacent="):
+            value = lowered.split("=", 1)[1]
+            if value in {"1", "true", "yes", "y"}:
+                wall_adjacent = True
+            elif value in {"0", "false", "no", "n"}:
+                wall_adjacent = False
+            else:
+                raise ValueError("wall_adjacent metadata must be true/false.")
+            continue
+        number_cells.append(cell)
 
     try:
         numbers = [float(value) for value in number_cells]
@@ -945,18 +2279,35 @@ def parse_csv_row(row: list[str]) -> tuple[str, str, tuple[float, ...]] | None:
         if ordered is None:
             raise ValueError("Quadpatch rows must define a convex quadrilateral.")
         geometry = tuple(float(value) for point in ordered for value in point)
-        return (name, kind, geometry)
+        return (name, kind, geometry, wall_adjacent)
+
+    if kind == "polypatch":
+        if len(numbers) < 6 or len(numbers) % 2 != 0:
+            raise ValueError("Polypatch rows must contain at least 3 x/y point pairs.")
+        point_pairs = [
+            (int(round(numbers[index])), int(round(numbers[index + 1])))
+            for index in range(0, len(numbers), 2)
+        ]
+        if not is_convex_polygon(point_pairs):
+            raise ValueError("Polypatch rows must define a convex polygon.")
+        geometry = tuple(float(value) for point in point_pairs for value in point)
+        return (name, kind, geometry, wall_adjacent)
 
     if len(numbers) != 3:
         raise ValueError("Circlepatch rows must contain center x, center y, and radius.")
     if numbers[2] <= 0:
         raise ValueError("Circlepatch radius must be positive.")
-    return (name, kind, (numbers[0], numbers[1], numbers[2]))
+    return (name, kind, (numbers[0], numbers[1], numbers[2]), wall_adjacent)
 
 
 def main() -> None:
+    hide_console_window()
+    configure_windows_app_id()
+    listener_socket = acquire_instance_listener()
     root = tk.Tk()
+    root.state("zoomed")
     app = WebcamPatchApp(root)
+    app.start_instance_listener(listener_socket)
     root.minsize(1100, 760)
     root.mainloop()
     del app
