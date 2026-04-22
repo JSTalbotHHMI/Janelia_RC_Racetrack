@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import csv
 import colorsys
+import importlib.util
 import math
 import random
 import socket
@@ -47,6 +48,7 @@ WINDOWS_APP_ID = "org.janelia.patch_generator"
 SCRIPT_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = SCRIPT_DIR / "assets"
 FAVICON_PATH = ASSETS_DIR / "patch_generator_favicon.png"
+PATCH_TO_HEADER_PATH = SCRIPT_DIR.parent / "patch-to-header" / "patch-to-header.py"
 PREVIEW_RED_BGR = (0, 0, 255)
 PREVIEW_RED_OUTLINE = "#FF0000"
 PREVIEW_RED_FILL_ALPHA = 0.30
@@ -57,6 +59,9 @@ DISPLAY_POLL_MS = 15
 CAMERA_FRAME_WIDTH = 1280
 CAMERA_FRAME_HEIGHT = 720
 CAMERA_FPS = 60
+DEFAULT_CALIBRATION_CSV = (
+    SCRIPT_DIR.parent.parent / "firmware" / "experiments" / "tracker" / "camera_calibration.csv"
+)
 SELECTED_OUTLINE_BGR = (0, 255, 255)
 SELECTED_FILL_ALPHA = 0.18
 EDIT_HANDLE_RADIUS = 7
@@ -80,6 +85,8 @@ INSTANCE_HOST = "127.0.0.1"
 INSTANCE_PORT = 49152 + (zlib.crc32(str(SCRIPT_DIR).encode("utf-8")) % 12000)
 INSTANCE_SHUTDOWN_MESSAGE = b"shutdown"
 INSTANCE_STARTUP_TIMEOUT_S = 5.0
+PATCH_TO_HEADER_MODULE_NAME = "patch_to_header_exporter"
+_PATCH_TO_HEADER_MODULE = None
 
 
 @dataclass
@@ -114,6 +121,13 @@ class EditDragState:
     original_geometry: tuple[float, ...]
     handle_index: int | None = None
     original_circle_handle_angle: float | None = None
+
+
+@dataclass(frozen=True)
+class CameraCalibrationSetting:
+    property_name: str
+    property_id: int
+    value: float
 
 
 class InvalidPatchDialog(tk.Toplevel):
@@ -277,9 +291,11 @@ class WebcamPatchApp:
         self.button_style_name = "Compact.TButton"
         self.instance_listener_socket: socket.socket | None = None
         self.instance_listener_thread: threading.Thread | None = None
+        self.camera_calibration_path: Path | None = DEFAULT_CALIBRATION_CSV if DEFAULT_CALIBRATION_CSV.exists() else None
 
         self.status_var = tk.StringVar(value="Waiting for video feed...")
         self.file_var = tk.StringVar(value="CSV: none")
+        self.calibration_var = tk.StringVar(value=self.format_calibration_label())
 
         self._configure_window_icon()
         self._build_ui()
@@ -349,6 +365,10 @@ class WebcamPatchApp:
                 if message.strip() == INSTANCE_SHUTDOWN_MESSAGE:
                     self.root.after(0, self.on_close)
                     break
+
+    def format_calibration_label(self) -> str:
+        calibration_name = self.camera_calibration_path.name if self.camera_calibration_path is not None else "(none)"
+        return f"Calibration: {calibration_name}"
 
     def _build_ui(self) -> None:
         style = ttk.Style()
@@ -445,7 +465,7 @@ class WebcamPatchApp:
         side = ttk.Frame(main, width=280)
         side.grid(row=0, column=1, sticky="ns")
         side.columnconfigure(0, weight=1)
-        side.rowconfigure(4, weight=1)
+        side.rowconfigure(5, weight=1)
 
         controls_label = ttk.Label(side, text="Controls", font=("", 12, "bold"))
         controls_label.grid(row=0, column=0, sticky="w", pady=(0, 10))
@@ -510,6 +530,7 @@ class WebcamPatchApp:
         load_button_row.grid(row=3, column=0, sticky="ew", pady=2)
         load_button_row.columnconfigure(0, weight=1)
         load_button_row.columnconfigure(1, weight=1)
+        load_button_row.columnconfigure(2, weight=1)
 
         self.load_button = ttk.Button(
             load_button_row,
@@ -527,12 +548,58 @@ class WebcamPatchApp:
             state=tk.DISABLED,
             style=self.button_style_name,
         )
-        self.reload_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self.reload_button.grid(row=0, column=1, sticky="ew", padx=2)
+
+        self.export_button = ttk.Button(
+            load_button_row,
+            text="Export",
+            command=self.export_header,
+            state=tk.DISABLED,
+            style=self.button_style_name,
+        )
+        self.export_button.grid(row=0, column=2, sticky="ew", padx=(2, 0))
+
+        calibration_button_row = ttk.Frame(side)
+        calibration_button_row.grid(row=4, column=0, sticky="ew", pady=(2, 0))
+        calibration_button_row.columnconfigure(0, weight=1)
+
+        self.calibration_button = ttk.Button(
+            calibration_button_row,
+            text="Calibration",
+            command=self.choose_calibration_csv,
+            state=tk.DISABLED,
+            style=self.button_style_name,
+        )
+        self.calibration_button.grid(row=0, column=0, sticky="ew")
 
         table_frame = ttk.LabelFrame(side, text="Patches", padding=8)
-        table_frame.grid(row=4, column=0, sticky="nsew", pady=(12, 0))
+        table_frame.grid(row=5, column=0, sticky="nsew", pady=(12, 0))
         table_frame.columnconfigure(0, weight=1)
-        table_frame.rowconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=0)
+        table_frame.rowconfigure(1, weight=1)
+
+        reorder_button_row = ttk.Frame(table_frame)
+        reorder_button_row.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        reorder_button_row.columnconfigure(0, weight=1)
+        reorder_button_row.columnconfigure(1, weight=1)
+
+        self.move_up_button = ttk.Button(
+            reorder_button_row,
+            text="Up",
+            command=lambda: self.move_selected_patch(-1),
+            state=tk.DISABLED,
+            style=self.button_style_name,
+        )
+        self.move_up_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+
+        self.move_down_button = ttk.Button(
+            reorder_button_row,
+            text="Down",
+            command=lambda: self.move_selected_patch(1),
+            state=tk.DISABLED,
+            style=self.button_style_name,
+        )
+        self.move_down_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
         self.table = ttk.Treeview(
             table_frame,
@@ -547,19 +614,21 @@ class WebcamPatchApp:
         self.table.column("wall", width=52, anchor="center", stretch=False)
         self.table.column("name", width=150, anchor="w")
         self.table.column("type", width=100, anchor="w")
-        self.table.grid(row=0, column=0, sticky="nsew")
+        self.table.grid(row=1, column=0, sticky="nsew")
         self.table.bind("<<TreeviewSelect>>", self.on_table_select)
         self.table.bind("<ButtonRelease-1>", self.on_table_click)
         self.table.tag_configure("selected_patch_row", font=self.table_selected_font)
 
         scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.table.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
+        scrollbar.grid(row=1, column=1, sticky="ns")
         self.table.configure(yscrollcommand=scrollbar.set)
 
+        calibration_label = ttk.Label(side, textvariable=self.calibration_var, wraplength=250)
+        calibration_label.grid(row=6, column=0, sticky="ew", pady=(12, 4))
         file_label = ttk.Label(side, textvariable=self.file_var, wraplength=250)
-        file_label.grid(row=5, column=0, sticky="ew", pady=(12, 4))
+        file_label.grid(row=7, column=0, sticky="ew", pady=(4, 4))
         status_label = ttk.Label(side, textvariable=self.status_var, wraplength=250, justify="left")
-        status_label.grid(row=6, column=0, sticky="ew")
+        status_label.grid(row=8, column=0, sticky="ew")
 
         for widget in (
             side,
@@ -567,7 +636,9 @@ class WebcamPatchApp:
             patch_button_row,
             file_button_row,
             load_button_row,
+            calibration_button_row,
             table_frame,
+            calibration_label,
             file_label,
             status_label,
         ):
@@ -603,6 +674,78 @@ class WebcamPatchApp:
             ],
         )
 
+    def load_camera_calibration(self, csv_path: Path) -> list[CameraCalibrationSetting]:
+        if not csv_path.exists():
+            return []
+
+        loaded_settings: list[CameraCalibrationSetting] = []
+        with csv_path.open("r", newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                property_name = row.get("property_name", "").strip()
+                if not property_name:
+                    continue
+                loaded_settings.append(
+                    CameraCalibrationSetting(
+                        property_name=property_name,
+                        property_id=int(row["property_id"]),
+                        value=float(row["value"]),
+                    )
+                )
+        return loaded_settings
+
+    def apply_camera_calibration(self, capture: cv2.VideoCapture, csv_path: Path) -> list[str]:
+        settings = self.load_camera_calibration(csv_path)
+        if not settings:
+            return []
+
+        results: list[str] = []
+        for setting in settings:
+            applied = capture.set(setting.property_id, setting.value)
+            actual_value = capture.get(setting.property_id)
+            status = "ok" if applied else "ignored"
+            results.append(
+                f"{setting.property_name}: requested {setting.value:.3f}, camera reports {actual_value:.3f} ({status})"
+            )
+        return results
+
+    def choose_calibration_csv(self) -> None:
+        initial_path = self.camera_calibration_path or DEFAULT_CALIBRATION_CSV
+        selected = filedialog.askopenfilename(
+            parent=self.root,
+            title="Select camera calibration CSV",
+            initialdir=str(initial_path.parent) if initial_path is not None else str(SCRIPT_DIR),
+            initialfile=initial_path.name if initial_path is not None else "",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not selected:
+            return
+
+        path = Path(selected)
+        try:
+            with self.state_lock:
+                capture = self.capture
+            results = [] if capture is None else self.apply_camera_calibration(capture, path)
+        except (OSError, ValueError, KeyError) as exc:
+            messagebox.showerror(
+                "Calibration Error",
+                f"Could not load the camera calibration CSV.\n\n{exc}",
+                parent=self.root,
+            )
+            return
+
+        self.camera_calibration_path = path
+        self.calibration_var.set(self.format_calibration_label())
+
+        if capture is None:
+            self.status_var.set(f"Calibration CSV selected: {path.name}. It will be applied when the camera opens.")
+            return
+
+        if results:
+            self.status_var.set(f"Applied calibration from {path.name}.")
+        else:
+            self.status_var.set(f"Calibration CSV selected: {path.name}. No settings were found to apply.")
+
     def _open_camera(self) -> cv2.VideoCapture | None:
         capture: cv2.VideoCapture | None = None
         if hasattr(cv2, "CAP_DSHOW"):
@@ -625,6 +768,18 @@ class WebcamPatchApp:
         capture.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
         if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
             capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        calibration_path = self.camera_calibration_path
+        if calibration_path is not None and calibration_path.exists():
+            try:
+                self.apply_camera_calibration(capture, calibration_path)
+            except (OSError, ValueError, KeyError) as exc:
+                self.root.after(
+                    0,
+                    lambda: self.status_var.set(
+                        f"Failed to apply calibration {calibration_path.name}: {exc}"
+                    ),
+                )
 
         return capture
 
@@ -1348,6 +1503,7 @@ class WebcamPatchApp:
         selection = self.table.selection()
         new_patch_tag = selection[0] if selection else None
         self.select_patch(new_patch_tag)
+        self.update_reorder_button_states()
 
     def on_sidebar_background_click(self, event: tk.Event) -> None:
         with self.state_lock:
@@ -1366,16 +1522,39 @@ class WebcamPatchApp:
                 base_tags.append("selected_patch_row")
             self.table.item(item_id, tags=tuple(base_tags))
 
+    def update_reorder_button_states(self) -> None:
+        if not getattr(self, "video_ready", False):
+            self.move_up_button.config(state=tk.DISABLED)
+            self.move_down_button.config(state=tk.DISABLED)
+            return
+
+        selected_tag = None
+        children = list(self.table.get_children())
+        selection = self.table.selection()
+        if selection:
+            selected_tag = selection[0]
+
+        if selected_tag is None or selected_tag not in children:
+            self.move_up_button.config(state=tk.DISABLED)
+            self.move_down_button.config(state=tk.DISABLED)
+            return
+
+        selected_index = children.index(selected_tag)
+        self.move_up_button.config(state=tk.NORMAL if selected_index > 0 else tk.DISABLED)
+        self.move_down_button.config(state=tk.NORMAL if selected_index < len(children) - 1 else tk.DISABLED)
+
     def apply_table_selection(self, table_tag: str | None) -> None:
         self.ignore_table_select_event = True
         try:
             if table_tag is None:
                 self.table.selection_remove(self.table.selection())
+                self.update_reorder_button_states()
                 return
             if self.table.exists(table_tag):
                 self.table.selection_set((table_tag,))
                 self.table.focus(table_tag)
                 self.table.see(table_tag)
+            self.update_reorder_button_states()
         finally:
             self.root.after_idle(self.clear_ignore_table_select_event)
 
@@ -1532,6 +1711,62 @@ class WebcamPatchApp:
                 return
         state_text = "enabled" if patch.wall_adjacent else "cleared"
         self.status_var.set(f'Wall-adjacent flag {state_text} for "{patch.name}".')
+
+    def move_selected_patch(self, direction: int) -> None:
+        if direction not in (-1, 1):
+            raise ValueError("direction must be -1 or 1")
+
+        selected_items = self.table.selection()
+        if not selected_items:
+            self.status_var.set("Select a patch in the table to reorder it.")
+            self.update_reorder_button_states()
+            return
+
+        selected_tag = selected_items[0]
+        patch = self.get_patch_by_tag(selected_tag)
+        if patch is None:
+            self.update_reorder_button_states()
+            return
+
+        invalid_reason = self.invalid_geometry_reason(patch.kind, patch.geometry)
+        if invalid_reason is not None:
+            self.status_var.set(f'Finish fixing "{patch.name}" before reordering it.')
+            return
+
+        with self.state_lock:
+            current_index = next(
+                (index for index, existing_patch in enumerate(self.patches) if existing_patch.table_tag == selected_tag),
+                None,
+            )
+            if current_index is None:
+                return
+            target_index = current_index + direction
+            if target_index < 0 or target_index >= len(self.patches):
+                self.update_reorder_button_states()
+                return
+            moved_patch = self.patches.pop(current_index)
+            self.patches.insert(target_index, moved_patch)
+
+        self.table.move(selected_tag, "", target_index)
+        self.apply_table_selection(selected_tag)
+        self.refresh_table_selection_styles()
+
+        if not self.write_all_patches_to_csv():
+            with self.state_lock:
+                reverted_index = next(
+                    (index for index, existing_patch in enumerate(self.patches) if existing_patch.table_tag == selected_tag),
+                    None,
+                )
+                if reverted_index is not None:
+                    reverted_patch = self.patches.pop(reverted_index)
+                    self.patches.insert(current_index, reverted_patch)
+            self.table.move(selected_tag, "", current_index)
+            self.apply_table_selection(selected_tag)
+            self.refresh_table_selection_styles()
+            return
+
+        direction_text = "up" if direction < 0 else "down"
+        self.status_var.set(f'Moved "{patch.name}" {direction_text}.')
 
     def find_patch_at_point(self, point: tuple[int, int]) -> PatchRecord | None:
         with self.state_lock:
@@ -1864,6 +2099,53 @@ class WebcamPatchApp:
         self.status_var.set(f"Reloaded {len(self.patches)} patch(es) from {path.name}. Click a patch to edit it.")
         self.update_button_states()
 
+    def export_header(self) -> None:
+        if not self.finalize_selected_patch_on_deselect():
+            return
+        if self.current_csv_path is None:
+            messagebox.showwarning(
+                "No CSV File",
+                "Create or load a patch CSV before exporting a header.",
+                parent=self.root,
+            )
+            return
+
+        csv_path = self.current_csv_path.resolve()
+        if not csv_path.exists():
+            messagebox.showwarning(
+                "CSV File Missing",
+                f"The active CSV file no longer exists:\n\n{csv_path}\n\nPlease create or load a CSV file first.",
+                parent=self.root,
+            )
+            return
+
+        try:
+            patch_to_header = load_patch_to_header_module()
+            patches = patch_to_header.load_patches(csv_path)
+            output_path = patch_to_header.resolve_default_output_path(csv_path)
+            header_text = patch_to_header.build_header(
+                patches=patches,
+                source_name=csv_path.name,
+                script_name=PATCH_TO_HEADER_PATH.name,
+                array_name="patches",
+                count_name="PATCH_COUNT",
+            )
+            output_path.write_text(header_text, encoding="utf-8", newline="\n")
+        except Exception as exc:
+            messagebox.showerror(
+                "Export Error",
+                f"Could not export the header file.\n\n{exc}",
+                parent=self.root,
+            )
+            return
+
+        self.status_var.set(f"Exported header: {output_path.name}")
+        messagebox.showinfo(
+            "Export Complete",
+            f"Header exported successfully:\n\n{output_path}",
+            parent=self.root,
+        )
+
     def create_new_csv(self) -> None:
         if not self.finalize_selected_patch_on_deselect():
             return
@@ -1947,6 +2229,7 @@ class WebcamPatchApp:
             self.latest_frame_size = None
         for item in self.table.get_children():
             self.table.delete(item)
+        self.update_reorder_button_states()
 
         if reset_file:
             self.current_csv_path = None
@@ -1961,17 +2244,24 @@ class WebcamPatchApp:
             self.circle_button.config(state=tk.DISABLED)
             self.poly_button.config(state=tk.DISABLED)
             self.reload_button.config(state=tk.DISABLED)
+            self.export_button.config(state=tk.DISABLED)
+            self.calibration_button.config(state=tk.DISABLED)
+            self.move_up_button.config(state=tk.DISABLED)
+            self.move_down_button.config(state=tk.DISABLED)
             return
 
         self.load_button.config(state=tk.NORMAL)
         self.clear_button.config(state=tk.NORMAL)
         self.new_button.config(state=tk.NORMAL)
+        self.calibration_button.config(state=tk.NORMAL)
 
         patch_state = tk.NORMAL if self.current_csv_path is not None else tk.DISABLED
         self.quad_button.config(state=patch_state)
         self.circle_button.config(state=patch_state)
         self.poly_button.config(state=patch_state)
         self.reload_button.config(state=patch_state)
+        self.export_button.config(state=patch_state)
+        self.update_reorder_button_states()
 
     def hide_waiting_overlay(self) -> None:
         if self.waiting_text_item is not None:
@@ -2097,6 +2387,26 @@ def complementary_bgr(color_bgr: tuple[int, int, int]) -> tuple[int, int, int]:
 
 def checkbox_text(is_checked: bool) -> str:
     return "[x]" if is_checked else "[ ]"
+
+
+def load_patch_to_header_module():
+    global _PATCH_TO_HEADER_MODULE
+
+    if _PATCH_TO_HEADER_MODULE is not None:
+        return _PATCH_TO_HEADER_MODULE
+
+    if not PATCH_TO_HEADER_PATH.exists():
+        raise FileNotFoundError(f"Could not find patch-to-header script at {PATCH_TO_HEADER_PATH}")
+
+    spec = importlib.util.spec_from_file_location(PATCH_TO_HEADER_MODULE_NAME, PATCH_TO_HEADER_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load module spec from {PATCH_TO_HEADER_PATH}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[PATCH_TO_HEADER_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    _PATCH_TO_HEADER_MODULE = module
+    return module
 
 
 def hide_console_window() -> None:

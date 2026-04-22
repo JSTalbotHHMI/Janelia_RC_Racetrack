@@ -1,26 +1,35 @@
 # Software
 
-This directory contains the software side of the racetrack project, from embedded sketches to desktop utilities.
+This directory contains the software side of the racetrack project, from embedded sketches and Python tracker tools to standalone patch-authoring utilities.
 
 ## Layout
 
-- [`firmware/`](firmware/README.md): Arduino and Teensy sketches, plus embedded support code
-- [`host/`](host/README.md): future host-side applications that talk to hardware or cameras
-- [`shared/`](shared/README.md): future shared formats, protocol definitions, and reusable software assets
-- [`utilities/`](utilities/README.md): standalone support scripts and tools used during development
+- [`firmware/`](firmware/README.md)
+  Arduino, Teensy, and Python-based race-control or vision workflows.
+- [`host/`](host/README.md)
+  Reserved for larger host-side applications and services.
+- [`shared/`](shared/README.md)
+  Shared formats, datasets, and reusable software assets.
+- [`utilities/`](utilities/README.md)
+  Standalone development tools such as the patch editor and CSV-to-header converter.
 
-## Current Focus
+## What Is Implemented Today
 
-The most complete software workflow in the repository today is the reactive LED pipeline:
+- Patch creation and export tooling under `utilities/patch-generator/` and `utilities/patch-to-header/`
+- Reactive LED controller sketches and runtime patch-loading experiments under `firmware/experiments/`
+- Blob tracking, overlay, and lap-board prototypes under `firmware/experiments/BlobTracker/`
+- System-level race-operation tools under `firmware/systems/Timetrials/`
+- Stable lighting-controller firmware under `firmware/systems/LightCoordinator/`
 
-1. Define track regions as patches with `utilities/patch-generator/`.
-2. Convert those patch CSV files into an Arduino header with `utilities/patch-to-header/`.
-3. Include the generated header in the loadable reactive LED sketch under `firmware/experiments/`.
+## Typical Workflow
 
-The firmware experiments directory also contains RC car control sketches for the ArC Porsche platform, including a Python sender for synthetic path-following error packets.
+1. Build or edit the patch CSV in `utilities/patch-generator/`.
+2. Convert it to a header with `utilities/patch-to-header/` or export it directly from the GUI.
+3. Use that patch definition in an experiment or system sketch under `firmware/`.
+4. If you are running the tracker stack, share the same calibration and patch data with the tools in `firmware/experiments/BlobTracker/` or `firmware/systems/Timetrials/`.
 
 ## Notes
 
-- Several sketches target Teensy hardware and reference `FastLED`.
-- The ArC Porsche control sketches use the `MCP4261` digital potentiometer library.
-- Python helper scripts in this repo use packages such as `opencv-python`, `Pillow`, `numpy`, and `pyserial` depending on the tool.
+- Teensy and Arduino sketches in this repo rely on LED libraries such as `FastLED` or `Adafruit_NeoPixel`, depending on the target.
+- Python tools in this tree use packages such as `opencv-python`, `numpy`, `Pillow`, and `pyserial`.
+- `host/` and `shared/` are still mostly placeholders, while the active implementation work is concentrated in `firmware/` and `utilities/`.

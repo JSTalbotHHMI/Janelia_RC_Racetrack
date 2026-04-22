@@ -21,8 +21,16 @@ This folder contains RC car control experiments built around an `MCP4261` digita
 - `dummyController_FigureEight_ErrorCommunication.py`
   Python sender that streams synthetic error packets so the path follower can be tested without a live vision pipeline.
 
-## Notes
+## Hardware And Dependencies
 
-- Several sketches reference Teensy 4.0 wiring and software SPI connections for the MCP4261.
-- Calibration values are sketch-local right now, so compare constants before assuming one experiment's steering or throttle ranges match another's.
-- If one of these variants becomes the preferred control baseline, consider promoting it to `../../systems/` and moving shared helpers into `../../shared/`.
+- The sketches target a Teensy-based setup with software SPI connections to the `MCP4261`.
+- Calibration values are still sketch-local, so steering and throttle ranges are not automatically consistent across experiments.
+- The helper sender script only needs Python standard-library modules and can be used to bench-test serial handling before the vision stack is connected.
+
+## Suggested Usage
+
+1. Start with `ArC_Porsche/` or `ArC_Porsche_SmoothTurn/` when validating wiring and steering direction.
+2. Move to `ArC_Porsche_PathFollower/` once you are ready to feed external error signals into the control loop.
+3. Use `dummyController_FigureEight_ErrorCommunication.py` to generate repeatable `ERR,...` traffic while tuning.
+
+If one of these variants becomes the preferred control baseline, promote it to `../../systems/` and move shared helpers into `../../shared/`.

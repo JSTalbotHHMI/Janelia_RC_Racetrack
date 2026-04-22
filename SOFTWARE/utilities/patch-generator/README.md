@@ -2,58 +2,82 @@
 
 `patch_generator.py` is a desktop tool for creating and editing patch-definition CSV files from a live webcam feed.
 
-It fits into the reactive LED workflow like this:
+It fits into the lighting workflow like this:
 
-1. draw patches here and save a CSV
-2. convert that CSV with [`../patch-to-header/`](../patch-to-header/README.md)
-3. include the generated header in a firmware sketch such as `ReactiveLEDs_LoadablePatches`
+1. draw or edit patches here and save a CSV
+2. export that CSV to a header, or convert it with [`../patch-to-header/`](../patch-to-header/README.md)
+3. optionally stream the CSV live to a controller with `serial_patch_loader.py`
+4. include the generated header in a firmware sketch when you want a compiled-in startup patch set
 
-It lets a user:
+## Features
+
+The tool lets you:
+
 - view a live camera image
-- place `quadpatch` regions by clicking 4 points
-- place `polypatch` regions by clicking 3 or more points
+- place `quadpatch` regions by clicking four points
+- place `polypatch` regions by clicking three or more points
 - place `circlepatch` regions by clicking a center, then dragging to set the radius
 - modify existing patches directly in the video display
+- load a tracker-style camera calibration CSV and apply those webcam settings
 - save patch definitions to a CSV file
+- export the active CSV directly to an Arduino header
 - reload an existing CSV and redraw its saved patches
+- mark whether a patch is wall-adjacent
+- reorder patches in the CSV and table
 
 ## Requirements
 
 - Python 3
-- [Pillow](https://pypi.org/project/Pillow/)
-- [OpenCV for Python](https://pypi.org/project/opencv-python/)
+- `opencv-python`
+- `numpy`
+- `Pillow`
+- `pyserial`
+- `tkinter`
 - a working webcam
 
-Install dependencies with:
+Install the Python packages with:
 
 ```powershell
-pip install pillow opencv-python numpy
+pip install opencv-python numpy pillow pyserial
 ```
 
 ## Running
 
-From this folder, run:
+From this folder:
 
 ```powershell
 python patch_generator.py
 ```
 
-When the camera is available, the live feed will appear and the patch controls will enable.
+When the camera opens successfully, the live feed appears and the patch controls become available.
 
-## Interface
+## Main Controls
 
-The main controls are:
-- `New`: create a new patch CSV
-- `Load`: open an existing patch CSV
-- `Reload`: reload the currently active CSV from disk
-- `Clear`: clear the current patch list and unload the active CSV
-- `Quadpatch`: create a 4-corner polygon patch
-- `Polypatch`: create a convex polygon patch with 3 or more points
-- `Circlepatch`: create a circular patch
+- `New`
+  Create a new patch CSV.
+- `Load`
+  Open an existing patch CSV from disk.
+- `Reload`
+  Re-read the currently active CSV.
+- `Export`
+  Run the shared `patch-to-header.py` converter and write a `.h` file beside the active CSV.
+- `Calibration`
+  Choose a camera-settings CSV in the tracker format.
+- `Clear`
+  Clear the current patch list and unload the active CSV.
+- `Quadpatch`
+  Create a four-corner polygon patch.
+- `Polypatch`
+  Create a convex polygon patch with three or more points.
+- `Circlepatch`
+  Create a circular patch.
+- `Up` / `Down`
+  Move the selected patch earlier or later in the table and CSV order.
 
 ## Editing Existing Patches
 
 After a CSV is loaded, existing patches can be modified directly in the video display:
+
 - click a patch to select it
 - drag inside a selected patch to move it
 - drag a vertex handle on a quadpatch or polypatch to reshape it
@@ -65,45 +89,76 @@ After a CSV is loaded, existing patches can be modified directly in the video di
 
 Edits are written back to the active CSV when the patch is deselected.
 
-While a patch is selected, its geometry is allowed to become temporarily invalid.
-When an invalid patch is deselected, the app asks whether to:
-- `Edit`: keep the patch selected and continue editing from its current shape
-- `Cancel`: discard all changes made while that patch was selected
-
-The table also includes a `Wall` checkbox column:
-- click the checkbox cell to mark or clear whether a patch is wall-adjacent
-- the wall-adjacent flag is saved into the CSV
+If a patch becomes invalid while it is selected, the app lets you either continue editing or discard those changes when the patch is deselected.
 
 ## Creating A New CSV
 
-When a user creates a new CSV:
-- if they choose a normal folder, the file is created in that folder's `output/` subfolder
-- if the `output/` subfolder does not exist, it is created automatically
-- if they choose an `output/` folder directly, that same folder is used
+When you create a new CSV:
 
-Generated CSV files are intended to live in `output/` instead of beside the source code.
+- choosing a normal folder creates the file inside that folder's `output/` subfolder
+- the `output/` subfolder is created automatically when needed
+- choosing an `output/` folder directly uses that folder as-is
 
-## Loading And Reloading
+Generated CSV files are intended to live in `output/` rather than beside the source code.
 
-- `Load` opens an existing CSV file from any location.
-- `Reload` re-reads the currently active CSV from disk.
-- If the active CSV file was deleted or moved, `Reload` resets the app to the same state as having no CSV loaded and shows a warning.
+## Live Serial Patch Streaming
+
+[`serial_patch_loader.py`](C:\Users\talbotj\Documents\GitHub\Janelia_RC_Racetrack\SOFTWARE\utilities\patch-generator\serial_patch_loader.py) keeps a serial connection open to the controller, uploads the current CSV once, and re-uploads whenever the CSV changes on disk.
+
+That is useful with patch-loading controller sketches when you want edits to take effect immediately without reflashing.
+
+Example:
+
+```powershell
+python serial_patch_loader.py COM5 .\output\NewPatches.csv
+```
+
+Upload a runtime segment layout before the patches:
+
+```powershell
+python serial_patch_loader.py COM5 .\output\NewPatches.csv --segment-lengths 12,8,15
+```
+
+One-shot upload:
+
+```powershell
+python serial_patch_loader.py COM5 .\output\NewPatches.csv --once
+```
+
+Notes:
+
+- the script reuses the shared CSV parser from `patch-to-header.py`
+- `--segment-lengths` updates the active segment count and per-segment LED lengths before uploading patches
+- patches can target `segmentIndex=-1` to exist without an LED segment
+- the controller keeps its last valid patch set active if an upload fails validation
+- the serial port stays open, so repeated CSV edits do not require reconnecting
+
+## Camera Calibration CSV
+
+The `Calibration` button accepts the same CSV format used by the tracker tools:
+
+```text
+property_name,property_id,value
+```
+
+Those settings are applied through OpenCV `capture.set(...)`. If the generator finds a tracker calibration CSV on disk, it uses that as the initial calibration file on startup.
 
 ## CSV Format
 
 The tool writes rows in one of these forms:
 
 ```text
-quadpatch,name,wall_adjacent=true,x1,y1,x2,y2,x3,y3,x4,y4
-polypatch,name,wall_adjacent=true,x1,y1,x2,y2,x3,y3,...
-circlepatch,name,wall_adjacent=true,center_x,center_y,radius
+quadpatch,name,wall_adjacent=true,x1,y1,x2,y2,x3,y3,x4,y4[,segmentIndex]
+polypatch,name,wall_adjacent=true,x1,y1,x2,y2,x3,y3,...[,segmentIndex]
+circlepatch,name,wall_adjacent=true,center_x,center_y,radius[,segmentIndex]
 ```
 
 Notes:
+
 - quadpatch rows must define a convex quadrilateral
-- polypatch rows must define a convex polygon and include at least 3 point pairs
+- polypatch rows must define a convex polygon with at least three point pairs
 - circlepatch rows must have a positive radius
-- `wall_adjacent=true` or `wall_adjacent=false` metadata is supported and optional when loading older files
+- `wall_adjacent=true` or `wall_adjacent=false` metadata is supported
 - blank rows are ignored
 - simple header-style rows starting with `label` or `type` are ignored
 
@@ -114,13 +169,19 @@ Notes:
 3. Click `Quadpatch`, `Polypatch`, or `Circlepatch`.
 4. Click points in the video feed to define the patch.
 5. For `Circlepatch`, click once to place the center, then drag and release to set the radius.
-6. For `Polypatch`, press `Enter` after selecting at least 3 points.
+6. For `Polypatch`, press `Enter` after selecting at least three points.
 7. Enter a patch name when prompted.
-8. Continue adding patches as needed.
-8. Use `Reload` if the CSV changed on disk outside the app.
+8. Continue adding or editing patches as needed.
+9. Click `Export` to generate the matching header file.
+10. Use `serial_patch_loader.py` if you want the active controller to pick up CSV changes live.
 
 ## Files In This Folder
 
-- [patch_generator.py](C:\Users\talbotj\Documents\GitHub\Janelia_RC_Racetrack\SOFTWARE\utilities\patch-generator\patch_generator.py): main application
-- `assets/`: static assets used by the GUI, including the window icon
-- `output/`: generated CSV files
+- [patch_generator.py](C:\Users\talbotj\Documents\GitHub\Janelia_RC_Racetrack\SOFTWARE\utilities\patch-generator\patch_generator.py)
+  Main GUI application.
+- [serial_patch_loader.py](C:\Users\talbotj\Documents\GitHub\Janelia_RC_Racetrack\SOFTWARE\utilities\patch-generator\serial_patch_loader.py)
+  Serial watcher and uploader for runtime patch updates.
+- `assets/`
+  Static assets used by the GUI, including the window icon.
+- `output/`
+  Generated CSV and header files.

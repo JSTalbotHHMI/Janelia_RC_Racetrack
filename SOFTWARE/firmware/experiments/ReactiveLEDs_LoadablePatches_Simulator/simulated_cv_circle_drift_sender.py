@@ -25,6 +25,7 @@ import sys
 import time
 import traceback
 from collections import deque
+from dataclasses import dataclass
 
 try:
     import cv2
@@ -52,8 +53,19 @@ ARROW_THICKNESS_PX = 2
 YELLOW_BGR = (0, 255, 255)
 BLUE_BGR = (255, 0, 0)
 WARNING_RED_BGR = (0, 0, 255)
+SUCCESS_GREEN_BGR = (0, 200, 0)
+WHITE_BGR = (255, 255, 255)
+BUTTON_FILL_BGR = (45, 45, 45)
+BUTTON_BORDER_BGR = (210, 210, 210)
 DRIFT_STATUS_THRESHOLD_DEG = 18.0
 HEADING_COLOR_FULL_SCALE_DEG = 45.0
+PATCH_SPACE_WIDTH = 1280.0
+PATCH_SPACE_HEIGHT = 720.0
+PATCH_SPACE_CENTER_X = PATCH_SPACE_WIDTH * 0.5
+PATCH_SPACE_CENTER_Y = PATCH_SPACE_HEIGHT * 0.5
+BUTTON_WIDTH_PX = 240
+BUTTON_HEIGHT_PX = 42
+BUTTON_MARGIN_PX = 16
 
 
 def wrap_angle_deg(angle_deg: float) -> float:
@@ -62,6 +74,67 @@ def wrap_angle_deg(angle_deg: float) -> float:
     while angle_deg <= -180.0:
         angle_deg += 360.0
     return angle_deg
+
+
+def cv_space_matches_patch_space(view_width: float, view_height: float) -> bool:
+    return (
+        abs(view_width - PATCH_SPACE_WIDTH) < 0.5
+        and abs(view_height - PATCH_SPACE_HEIGHT) < 0.5
+    )
+
+
+@dataclass
+class SerialConnectionState:
+    port: str
+    baud: int
+    startup_delay: float
+    handle: serial.SerialBase | None = None
+    last_error: str | None = None
+
+    @property
+    def is_connected(self) -> bool:
+        return self.handle is not None
+
+    def connect(self) -> None:
+        if self.handle is not None:
+            return
+
+        self.handle = serial.serial_for_url(self.port, self.baud, timeout=0.1)
+        time.sleep(self.startup_delay)
+        self.last_error = None
+        print(f"Serial connected on {self.port} at {self.baud} baud")
+
+    def disconnect(self) -> None:
+        if self.handle is None:
+            return
+
+        self.handle.close()
+        self.handle = None
+        print(f"Serial disconnected from {self.port}")
+
+    def toggle(self) -> None:
+        try:
+            if self.is_connected:
+                self.disconnect()
+            else:
+                self.connect()
+        except serial.SerialException as exc:
+            self.handle = None
+            self.last_error = str(exc)
+            print(f"Serial toggle failed for {self.port}: {exc}")
+
+    def send(self, packet: bytes) -> None:
+        if self.handle is None:
+            return
+
+        try:
+            self.handle.write(packet)
+            self.handle.flush()
+            self.last_error = None
+        except serial.SerialException as exc:
+            self.last_error = str(exc)
+            self.disconnect()
+            print(f"Serial write failed for {self.port}: {exc}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -427,6 +500,69 @@ def draw_text_block(frame, lines: list[str], color_bgr: tuple[int, int, int]) ->
         y += 28
 
 
+def serial_button_rect(frame_width: int, frame_height: int) -> tuple[int, int, int, int]:
+    x0 = BUTTON_MARGIN_PX
+    y0 = frame_height - BUTTON_MARGIN_PX - BUTTON_HEIGHT_PX
+    return x0, y0, x0 + BUTTON_WIDTH_PX, y0 + BUTTON_HEIGHT_PX
+
+
+def point_in_rect(point: tuple[int, int], rect: tuple[int, int, int, int]) -> bool:
+    x, y = point
+    x0, y0, x1, y1 = rect
+    return x0 <= x <= x1 and y0 <= y <= y1
+
+
+def draw_serial_button(
+    frame,
+    connected: bool,
+    port: str,
+    last_error: str | None,
+) -> tuple[int, int, int, int]:
+    frame_height, frame_width = frame.shape[:2]
+    rect = serial_button_rect(frame_width, frame_height)
+    x0, y0, x1, y1 = rect
+    fill = SUCCESS_GREEN_BGR if connected else WARNING_RED_BGR
+    label = f"{'Disconnect' if connected else 'Connect'} {port}"
+    status = "Serial connected" if connected else "Serial disconnected"
+    if last_error:
+        status = f"Serial error: {last_error}"
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x0, y0), (x1, y1), BUTTON_FILL_BGR, thickness=-1)
+    cv2.addWeighted(overlay, 0.35, frame, 0.65, 0.0, dst=frame)
+    cv2.rectangle(frame, (x0, y0), (x1, y1), fill, thickness=2)
+    cv2.putText(
+        frame,
+        label,
+        (x0 + 12, y0 + 27),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        WHITE_BGR,
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        status,
+        (x0, y0 - 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        fill if not last_error else WARNING_RED_BGR,
+        2,
+        cv2.LINE_AA,
+    )
+    return rect
+
+
+def serial_button_mouse_callback(event, x, y, _flags, state) -> None:
+    if event != cv2.EVENT_LBUTTONUP:
+        return
+
+    button_rect = state.get("button_rect")
+    if button_rect is not None and point_in_rect((x, y), button_rect):
+        state["toggle_requested"] = True
+
+
 def window_is_open(window_name: str) -> bool:
     try:
         return cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) >= 1
@@ -496,6 +632,21 @@ def main() -> int:
         f"({frame_width}x{frame_height}, backend={opened_backend})"
     )
     print(f"CV space: {view_width:.1f} x {view_height:.1f}")
+    if not cv_space_matches_patch_space(view_width, view_height):
+        print(
+            "WARNING: active CV space does not match the patch header space "
+            f"({PATCH_SPACE_WIDTH:.0f} x {PATCH_SPACE_HEIGHT:.0f})."
+        )
+        print(
+            "Patch coordinates were authored around "
+            f"center=({PATCH_SPACE_CENTER_X:.0f}, {PATCH_SPACE_CENTER_Y:.0f}); "
+            "orbit hits may not line up with the expected patches."
+        )
+        print(
+            "Recommendation: pass "
+            f"--view-width {PATCH_SPACE_WIDTH:.0f} --view-height {PATCH_SPACE_HEIGHT:.0f} "
+            f"--center-x {PATCH_SPACE_CENTER_X:.0f} --center-y {PATCH_SPACE_CENTER_Y:.0f}"
+        )
     print(
         "Circle:"
         f" center=({center_x:.1f}, {center_y:.1f})"
@@ -513,98 +664,112 @@ def main() -> int:
     print("Press q, Esc, or Ctrl+C to stop.")
 
     cv2.namedWindow(args.window_name, cv2.WINDOW_NORMAL)
+    mouse_state = {"toggle_requested": False, "button_rect": None}
+    cv2.setMouseCallback(args.window_name, serial_button_mouse_callback, mouse_state)
 
     position_history: deque[tuple[float, float]] = deque(maxlen=TRAIL_LENGTH)
+    serial_state = SerialConnectionState(args.port, args.baud, args.startup_delay)
+    try:
+        serial_state.connect()
+    except serial.SerialException as exc:
+        serial_state.last_error = str(exc)
+        print(f"Starting disconnected because {args.port!r} could not be opened: {exc}")
 
     try:
-        with serial.serial_for_url(args.port, args.baud, timeout=0.1) as ser:
-            time.sleep(args.startup_delay)
+        started_at = time.monotonic()
+        next_send = started_at
+        last_status = started_at - args.status_interval if args.status_interval > 0 else started_at
 
-            started_at = time.monotonic()
-            next_send = started_at
-            last_status = started_at - args.status_interval if args.status_interval > 0 else started_at
+        frame = initial_frame
 
-            frame = initial_frame
+        while True:
+            if not window_is_open(args.window_name):
+                break
 
-            while True:
-                if not window_is_open(args.window_name):
-                    break
-
+            now = time.monotonic()
+            if now < next_send:
+                time.sleep(next_send - now)
                 now = time.monotonic()
-                if now < next_send:
-                    time.sleep(next_send - now)
-                    now = time.monotonic()
 
-                next_frame = read_frame(capture)
-                if next_frame is not None:
-                    frame = next_frame
-                else:
-                    warning_frame = frame.copy()
-                    draw_text_block(
-                        warning_frame,
-                        [
-                            "Warning: video frame read failed.",
-                            "Continuing with the last good frame.",
-                        ],
-                        WARNING_RED_BGR,
-                    )
-                    frame = warning_frame
-                elapsed_s = now - started_at
-                x, y, travel_deg, heading_deg, drifting = compute_sample(
-                    elapsed_s=elapsed_s,
-                    center_x=center_x,
-                    center_y=center_y,
-                    radius=radius,
-                    lap_seconds=args.lap_seconds,
-                    start_angle_rad=start_angle_rad,
-                    drift_offset_deg=args.drift_offset_deg,
+            if mouse_state["toggle_requested"]:
+                mouse_state["toggle_requested"] = False
+                serial_state.toggle()
+
+            next_frame = read_frame(capture)
+            if next_frame is not None:
+                frame = next_frame
+            else:
+                warning_frame = frame.copy()
+                draw_text_block(
+                    warning_frame,
+                    [
+                        "Warning: video frame read failed.",
+                        "Continuing with the last good frame.",
+                    ],
+                    WARNING_RED_BGR,
                 )
+                frame = warning_frame
+            elapsed_s = now - started_at
+            x, y, travel_deg, heading_deg, drifting = compute_sample(
+                elapsed_s=elapsed_s,
+                center_x=center_x,
+                center_y=center_y,
+                radius=radius,
+                lap_seconds=args.lap_seconds,
+                start_angle_rad=start_angle_rad,
+                drift_offset_deg=args.drift_offset_deg,
+            )
 
-                position_history.append((x, y))
+            position_history.append((x, y))
 
-                packet = (
-                    f"CAR,{args.car_id},{x:.2f},{y:.2f},{travel_deg:.2f},{heading_deg:.2f}\n"
-                ).encode("ascii")
-                ser.write(packet)
-                ser.flush()
+            packet = (
+                f"CAR,{args.car_id},{x:.2f},{y:.2f},{travel_deg:.2f},{heading_deg:.2f}\n"
+            ).encode("ascii")
+            serial_state.send(packet)
 
-                annotated_frame = frame.copy()
-                draw_overlay(
-                    frame=annotated_frame,
-                    position_history=position_history,
-                    current_x=x,
-                    current_y=y,
-                    travel_deg=travel_deg,
-                    heading_deg=heading_deg,
-                    view_width=view_width,
-                    view_height=view_height,
+            annotated_frame = frame.copy()
+            draw_overlay(
+                frame=annotated_frame,
+                position_history=position_history,
+                current_x=x,
+                current_y=y,
+                travel_deg=travel_deg,
+                heading_deg=heading_deg,
+                view_width=view_width,
+                view_height=view_height,
+            )
+            mouse_state["button_rect"] = draw_serial_button(
+                annotated_frame,
+                connected=serial_state.is_connected,
+                port=args.port,
+                last_error=serial_state.last_error,
+            )
+            cv2.imshow(args.window_name, annotated_frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord("q")) or not window_is_open(args.window_name):
+                break
+
+            if args.status_interval > 0 and (now - last_status) >= args.status_interval:
+                state = "DRIFT" if drifting else "GRIP"
+                serial_note = "TX" if serial_state.is_connected else "NO-TX"
+                print(
+                    f"{state}/{serial_note} "
+                    f"x={x:7.2f} y={y:7.2f} "
+                    f"travel={travel_deg:7.2f} heading={heading_deg:7.2f}"
                 )
-                cv2.imshow(args.window_name, annotated_frame)
+                last_status = now
 
-                key = cv2.waitKey(1) & 0xFF
-                if key in (27, ord("q")) or not window_is_open(args.window_name):
-                    break
-
-                if args.status_interval > 0 and (now - last_status) >= args.status_interval:
-                    state = "DRIFT" if drifting else "GRIP"
-                    print(
-                        f"{state} "
-                        f"x={x:7.2f} y={y:7.2f} "
-                        f"travel={travel_deg:7.2f} heading={heading_deg:7.2f}"
-                    )
-                    last_status = now
-
-                next_send += interval_s
-                if next_send < now:
-                    next_send = now + interval_s
-    except serial.SerialException as exc:
-        raise SystemExit(f"Serial error while using {args.port!r}: {exc}") from exc
+            next_send += interval_s
+            if next_send < now:
+                next_send = now + interval_s
     except cv2.error as exc:
         raise SystemExit(
             "OpenCV GUI error. If the camera opens but the window fails, "
             "please share the traceback and try a different --video-backend."
         ) from exc
     finally:
+        serial_state.disconnect()
         capture.release()
         cv2.destroyAllWindows()
 

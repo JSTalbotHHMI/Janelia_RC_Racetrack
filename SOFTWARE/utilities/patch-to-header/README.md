@@ -2,7 +2,7 @@
 
 `patch-to-header.py` converts a patch-definition CSV into an Arduino-friendly header file.
 
-It is designed to pair with the CSV files created by [`../patch-generator/`](../patch-generator/README.md), though it can also be used with hand-edited CSV files that follow the same format.
+It is designed to pair with the CSV files created by [`../patch-generator/`](../patch-generator/README.md), but it also works with hand-edited CSV files that follow the same format.
 
 ## What It Produces
 
@@ -33,6 +33,7 @@ Notes:
 - `wall_adjacent` is optional.
 - `segmentIndex` can be supplied explicitly or omitted and assigned automatically.
 - blank rows and simple header rows beginning with `label`, `labels`, or `type` are ignored.
+- unrelated metadata fields are ignored rather than treated as fatal parse errors.
 
 ## Usage
 
@@ -55,3 +56,9 @@ python patch-to-header.py ..\patch-generator\output\PythonCirclePath.csv --array
 ```
 
 If `--output` is omitted, the script writes the header into an `output/` folder beside the CSV.
+
+## Where It Fits
+
+- Use it directly when you want a simple command-line conversion step.
+- The `patch-generator` GUI calls the same script when you click `Export`.
+- `serial_patch_loader.py` imports this script's parser so the serial uploader and header generator stay aligned on CSV handling rules.
