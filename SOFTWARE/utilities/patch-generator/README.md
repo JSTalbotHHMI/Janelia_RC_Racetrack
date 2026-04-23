@@ -14,8 +14,8 @@ It fits into the lighting workflow like this:
 The tool lets you:
 
 - view a live camera image
-- place `quadpatch` regions by clicking four points
-- place `polypatch` regions by clicking three or more points
+- place `quadpatch` rectangles by clicking two points for one side and a third point for the width
+- place `polypatch` regions by clicking three or more points, including concave shapes
 - place `circlepatch` regions by clicking a center, then dragging to set the radius
 - modify existing patches directly in the video display
 - load a tracker-style camera calibration CSV and apply those webcam settings
@@ -24,6 +24,7 @@ The tool lets you:
 - reload an existing CSV and redraw its saved patches
 - mark whether a patch is wall-adjacent
 - reorder patches in the CSV and table
+- assign patch names from a fixed function list instead of free text
 
 ## Requirements
 
@@ -66,13 +67,15 @@ When the camera opens successfully, the live feed appears and the patch controls
 - `Clear`
   Clear the current patch list and unload the active CSV.
 - `Quadpatch`
-  Create a four-corner polygon patch.
+  Create a rectangle by clicking two points for a side and a third point for its width.
 - `Polypatch`
-  Create a convex polygon patch with three or more points.
+  Create a simple polygon patch with three or more points.
 - `Circlepatch`
   Create a circular patch.
 - `Up` / `Down`
   Move the selected patch earlier or later in the table and CSV order.
+- `Delete`
+  Delete the selected patch.
 
 ## Editing Existing Patches
 
@@ -90,6 +93,24 @@ After a CSV is loaded, existing patches can be modified directly in the video di
 Edits are written back to the active CSV when the patch is deselected.
 
 If a patch becomes invalid while it is selected, the app lets you either continue editing or discard those changes when the patch is deselected.
+
+## Patch Naming
+
+New patches no longer use free-text names. Instead, the save dialog lets you choose from a fixed function list:
+
+- `finish`
+- `third`
+- `corner`
+- `point`
+- `DQ`
+- `ignore`
+
+The generator appends the next available number for numbered function names, such as `corner1`, `corner2`, or `point3`.
+
+Special rules:
+
+- `finish` can exist only once, and it is saved as `finish`
+- `third` can exist only twice, as `third1` and `third2`
 
 ## Creating A New CSV
 
@@ -155,8 +176,8 @@ circlepatch,name,wall_adjacent=true,center_x,center_y,radius[,segmentIndex]
 
 Notes:
 
-- quadpatch rows must define a convex quadrilateral
-- polypatch rows must define a convex polygon with at least three point pairs
+- quadpatch rows are saved as four rectangle corners
+- polypatch rows may be concave, but they must remain simple non-self-intersecting polygons with at least three point pairs
 - circlepatch rows must have a positive radius
 - `wall_adjacent=true` or `wall_adjacent=false` metadata is supported
 - blank rows are ignored
@@ -168,6 +189,7 @@ Notes:
 2. Click `New` to create a CSV, or `Load` to open an existing one.
 3. Click `Quadpatch`, `Polypatch`, or `Circlepatch`.
 4. Click points in the video feed to define the patch.
+   `Quadpatch` uses three clicks: side start, side end, then width.
 5. For `Circlepatch`, click once to place the center, then drag and release to set the radius.
 6. For `Polypatch`, press `Enter` after selecting at least three points.
 7. Enter a patch name when prompted.
