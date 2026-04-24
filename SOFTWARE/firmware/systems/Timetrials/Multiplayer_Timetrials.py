@@ -3050,16 +3050,20 @@ class TrackerApp:
             if not self.race_running or state.disqualified or state.finished:
                 continue
 
-            for patch_name in entering_patches:
-                if self.is_disqualifying_patch_name(patch_name):
-                    self.disqualify_car(track_index)
-                    break
-            if state.disqualified:
-                continue
+            entered_point_patch = False
 
             for patch_name in entering_patches:
                 if self.is_point_patch_name(patch_name):
                     self.apply_point_bonus(track_index)
+                    entered_point_patch = True
+
+            if not entered_point_patch:
+                for patch_name in entering_patches:
+                    if self.is_disqualifying_patch_name(patch_name):
+                        self.disqualify_car(track_index)
+                        break
+                if state.disqualified:
+                    continue
 
             for patch_name in PATCH_SEQUENCE:
                 if patch_name not in entering_patches:
