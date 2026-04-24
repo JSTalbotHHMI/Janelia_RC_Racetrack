@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import csv
 import json
 import math
 import time
@@ -25,6 +26,10 @@ CAMERA_FRAME_WIDTH = 1280
 CAMERA_FRAME_HEIGHT = 720
 CAMERA_FPS = 60
 MAX_CAMERA_INDEX_TO_PROBE = 8
+DEFAULT_CALIBRATION_CSV = Path(__file__).with_name('camera_calibration.csv')
+OUTPUT_DIR = Path(__file__).with_name('output')
+DEFAULT_EXTERNAL_CALIBRATION_CSV = OUTPUT_DIR / 'Calibrated.csv'
+CALIBRATION_PREFERENCE_FILE = OUTPUT_DIR / 'janelia_path_follower.default_calibration.txt'
 DEFAULT_SERIAL_PORT = 'COM6'
 DEFAULT_SERIAL_BAUD = 115200
 DEFAULT_STARTUP_DELAY_S = 2.0
@@ -60,6 +65,83 @@ class PathSample:
     s_norm: float
     speed_mps: float
     heading_offset_deg: float
+
+
+def load_camera_calibration(csv_path: str) -> list[tuple[str, int, float]]:
+    calibration_path = Path(csv_path)
+    if not calibration_path.exists():
+        return []
+    loaded_settings: list[tuple[str, int, float]] = []
+    with calibration_path.open('r', newline='', encoding='utf-8') as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            property_name = row.get('property_name', '').strip()
+            if not property_name:
+                continue
+            loaded_settings.append((property_name, int(row['property_id']), float(row['value'])))
+    return loaded_settings
+
+
+def save_default_calibration_path(csv_path: str) -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    CALIBRATION_PREFERENCE_FILE.write_text(csv_path, encoding='utf-8')
+
+
+def load_default_calibration_path() -> str | None:
+    if not CALIBRATION_PREFERENCE_FILE.exists():
+        return None
+    saved_path = CALIBRATION_PREFERENCE_FILE.read_text(encoding='utf-8').strip()
+    return saved_path or None
+
+
+def resolve_calibration_source(preferred_path: str | None = None) -> tuple[str | None, list[tuple[str, int, float]], str]:
+    candidate_paths: list[str] = []
+    if preferred_path:
+        candidate_paths.append(preferred_path)
+    remembered_path = load_default_calibration_path()
+    if remembered_path:
+        candidate_paths.append(remembered_path)
+    candidate_paths.append(str(DEFAULT_EXTERNAL_CALIBRATION_CSV))
+    candidate_paths.append(str(DEFAULT_CALIBRATION_CSV))
+
+    seen_paths: set[str] = set()
+    for candidate_path in candidate_paths:
+        normalized_path = str(Path(candidate_path))
+        if normalized_path in seen_paths:
+            continue
+        seen_paths.add(normalized_path)
+        settings = load_camera_calibration(normalized_path)
+        if settings:
+            return normalized_path, settings, normalized_path
+
+    return None, [], 'none loaded'
+
+
+def apply_calibration_settings(
+    capture: cv2.VideoCapture,
+    settings: list[tuple[str, int, float]],
+    source_label: str,
+) -> None:
+    if not settings:
+        return
+    print(f'Applying camera calibration from {source_label}')
+    for property_name, property_id, value in settings:
+        applied = capture.set(property_id, value)
+        actual_value = capture.get(property_id)
+        status = 'ok' if applied else 'ignored'
+        print(
+            f'  {property_name}: requested {value:.3f}, '
+            f'camera reports {actual_value:.3f} ({status})'
+        )
+
+
+def apply_default_camera_calibration(
+    capture: cv2.VideoCapture,
+    preferred_path: str | None = None,
+) -> tuple[str | None, str]:
+    resolved_path, settings, source_label = resolve_calibration_source(preferred_path)
+    apply_calibration_settings(capture, settings, source_label)
+    return resolved_path, source_label
 
 
 class SerialConnection:
@@ -118,6 +200,9 @@ class PathFollowerApp:
         self.last_detection_time_s: Optional[float] = None
         self.available_camera_indices: List[int] = []
         self.camera_combo: Optional[ttk.Combobox] = None
+        self.calibration_path = load_default_calibration_path()
+        self.calibration_source_label = self.calibration_path or 'none loaded'
+        self.calibration_label: Optional[ttk.Label] = None
 
         self._build_ui()
         self.refresh_camera_list(open_selected=True, announce=False)
@@ -151,12 +236,15 @@ class PathFollowerApp:
         self.camera_combo.grid(row=0, column=1, sticky='ew', pady=2)
         self.camera_combo.bind('<<ComboboxSelected>>', self.on_camera_selected)
         ttk.Button(form, text='Refresh', command=self.refresh_camera_list).grid(row=0, column=2, padx=(6, 0), pady=2)
-        ttk.Label(form, text='Serial port').grid(row=1, column=0, sticky='w')
-        ttk.Entry(form, textvariable=self.serial_port_var).grid(row=1, column=1, sticky='ew', pady=2)
-        ttk.Label(form, text='Baud').grid(row=2, column=0, sticky='w')
-        ttk.Entry(form, textvariable=self.serial_baud_var).grid(row=2, column=1, sticky='ew', pady=2)
-        ttk.Label(form, text='Lookahead px').grid(row=3, column=0, sticky='w')
-        ttk.Entry(form, textvariable=self.lookahead_override_var).grid(row=3, column=1, sticky='ew', pady=2)
+        self.calibration_label = ttk.Label(form, text=self.format_calibration_label(), justify='left')
+        self.calibration_label.grid(row=1, column=0, columnspan=3, sticky='ew', pady=(6, 2))
+        ttk.Button(form, text='Choose Calibration CSV', command=self.browse_calibration_file).grid(row=2, column=0, columnspan=3, sticky='ew', pady=(0, 6))
+        ttk.Label(form, text='Serial port').grid(row=3, column=0, sticky='w')
+        ttk.Entry(form, textvariable=self.serial_port_var).grid(row=3, column=1, sticky='ew', pady=2)
+        ttk.Label(form, text='Baud').grid(row=4, column=0, sticky='w')
+        ttk.Entry(form, textvariable=self.serial_baud_var).grid(row=4, column=1, sticky='ew', pady=2)
+        ttk.Label(form, text='Lookahead px').grid(row=5, column=0, sticky='w')
+        ttk.Entry(form, textvariable=self.lookahead_override_var).grid(row=5, column=1, sticky='ew', pady=2)
 
         btns = ttk.Frame(side)
         btns.grid(row=4, column=0, sticky='ew', pady=(10, 0))
@@ -224,6 +312,35 @@ class PathFollowerApp:
     def on_camera_selected(self, _event: tk.Event) -> None:
         self._open_camera(announce=True)
 
+    def format_calibration_label(self) -> str:
+        if self.calibration_path:
+            return f'Calibration CSV: {Path(self.calibration_path).name}'
+        return f'Calibration: {self.calibration_source_label}'
+
+    def browse_calibration_file(self) -> None:
+        initial_path = self.calibration_path or str(DEFAULT_EXTERNAL_CALIBRATION_CSV)
+        selected = filedialog.askopenfilename(
+            parent=self.root,
+            title='Select camera calibration CSV',
+            initialdir=str(Path(initial_path).parent),
+            initialfile=Path(initial_path).name,
+            filetypes=[('CSV files', '*.csv'), ('All files', '*.*')],
+        )
+        if not selected:
+            return
+        self.calibration_path = selected
+        self.calibration_source_label = selected
+        save_default_calibration_path(selected)
+        if self.calibration_label is not None:
+            self.calibration_label.configure(text=self.format_calibration_label())
+        if self.capture is not None:
+            resolved_path, source_label = apply_default_camera_calibration(self.capture, selected)
+            self.calibration_path = resolved_path
+            self.calibration_source_label = source_label
+            if self.calibration_label is not None:
+                self.calibration_label.configure(text=self.format_calibration_label())
+            self.status_var.set(f'Applied camera calibration from {source_label}.')
+
     def _open_camera(self, camera_index: Optional[int] = None, announce: bool = True) -> None:
         if camera_index is None:
             camera_index = self._selected_camera_index()
@@ -242,8 +359,11 @@ class PathFollowerApp:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_FRAME_HEIGHT)
         cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
         self.capture = cap
+        self.calibration_path, self.calibration_source_label = apply_default_camera_calibration(cap, self.calibration_path)
+        if self.calibration_label is not None:
+            self.calibration_label.configure(text=self.format_calibration_label())
         if announce:
-            self.status_var.set(f'Using camera {camera_index}.')
+            self.status_var.set(f'Using camera {camera_index}. Calibration: {self.calibration_source_label}.')
 
     def _schedule_refresh(self) -> None:
         self.root.after(DISPLAY_POLL_MS, self.update_frame)
