@@ -2125,6 +2125,48 @@ def point_in_patch(point: tuple[float, float], patch: PatchOverlayRecord) -> boo
     return point_in_polygon(point, vertices)
 
 
+def patch_name_contains(name: str, token: str) -> bool:
+    return token.strip().upper() in name.strip().upper()
+
+
+def build_patch_mask(
+    patches: list[PatchOverlayRecord],
+    width: int,
+    height: int,
+    source_width: int,
+    source_height: int,
+) -> np.ndarray:
+    mask = np.zeros((height, width), dtype=np.uint8)
+    if not patches:
+        return mask
+
+    scale_x = width / max(source_width, 1)
+    scale_y = height / max(source_height, 1)
+
+    def scale_point(x_value: float, y_value: float) -> tuple[int, int]:
+        return (
+            int(round(x_value * scale_x)),
+            int(round(y_value * scale_y)),
+        )
+
+    for patch in patches:
+        if patch.kind == "circlepatch":
+            center_x, center_y, radius = patch.numbers
+            center = scale_point(center_x, center_y)
+            radius_px = max(1, int(round(radius * 0.5 * (scale_x + scale_y))))
+            cv2.circle(mask, center, radius_px, 255, thickness=-1, lineType=cv2.LINE_AA)
+        else:
+            points = np.array(
+                [
+                    scale_point(patch.numbers[index], patch.numbers[index + 1])
+                    for index in range(0, len(patch.numbers), 2)
+                ],
+                dtype=np.int32,
+            )
+            cv2.fillPoly(mask, [points], 255, lineType=cv2.LINE_AA)
+    return mask
+
+
 def patch_base_color_bgr(patch_state: PatchOverlayState) -> tuple[int, int, int]:
     return YELLOW_BGR if patch_state.occupants else GRAY_BGR
 
@@ -2676,13 +2718,17 @@ class TrackerApp:
             return
         self.load_patch_file(selected, persist=True)
 
+    def led_controller_patches(self, patches: list[PatchOverlayRecord]) -> list[PatchOverlayRecord]:
+        return [patch for patch in patches if patch_name_contains(patch.name, "corner")]
+
     def upload_patch_file_to_controller(self, patch_path: Path) -> None:
         if not self.serial_state.enabled:
             self.serial_state.last_error = None
             return
         if self.serial_state.handle is None:
             self.serial_state.connect()
-        self.serial_state.upload_patch_file(patch_path)
+        patches = load_patch_overlay(str(patch_path))
+        self.serial_state.upload_patch_records(self.led_controller_patches(patches))
 
     def upload_patch_records_to_controller(self, patches: list[PatchOverlayRecord]) -> None:
         if not self.serial_state.enabled:
@@ -2690,7 +2736,7 @@ class TrackerApp:
             return
         if self.serial_state.handle is None:
             self.serial_state.connect()
-        self.serial_state.upload_patch_records(patches)
+        self.serial_state.upload_patch_records(self.led_controller_patches(patches))
 
     def load_patch_file(self, patch_path: str | None, persist: bool = False) -> None:
         if not patch_path:
@@ -3034,11 +3080,14 @@ class TrackerApp:
         if not self.running:
             return
         yview = self.status_text.yview()
+        was_at_bottom = bool(yview) and yview[1] >= 0.999
         self.status_text.configure(state="normal")
         self.status_text.delete("1.0", tk.END)
         self.status_text.insert("1.0", "\n".join(lines))
         self.status_text.configure(state="disabled")
-        if yview:
+        if was_at_bottom:
+            self.status_text.see(tk.END)
+        elif yview:
             self.status_text.yview_moveto(yview[0])
 
     def schedule_next_frame(self) -> None:
@@ -3175,16 +3224,29 @@ class TrackerApp:
         processing_frame: np.ndarray,
     ) -> tuple[list[Blob], list[Blob], list[tuple[Blob, Blob] | None]]:
         hsv_frame = preprocess_frame(processing_frame, self.args.blur_kernel)
+        ignore_patches = [patch for patch in self.loaded_patches if patch_name_contains(patch.name, "ignore")]
+        ignore_mask = build_patch_mask(
+            ignore_patches,
+            processing_frame.shape[1],
+            processing_frame.shape[0],
+            self.patch_source_width,
+            self.patch_source_height,
+        )
         scaled_min_area = self.args.min_area * self.processing_scale * self.processing_scale
         scaled_max_area = self.args.max_area * self.processing_scale * self.processing_scale
         scaled_max_pair_distance = self.args.max_pair_distance * self.processing_scale
+        red_mask = make_color_mask(hsv_frame, "red", self.args.morph_kernel)
+        blue_mask = make_color_mask(hsv_frame, "blue", self.args.morph_kernel)
+        if np.any(ignore_mask):
+            red_mask = cv2.bitwise_and(red_mask, cv2.bitwise_not(ignore_mask))
+            blue_mask = cv2.bitwise_and(blue_mask, cv2.bitwise_not(ignore_mask))
         red_blobs = extract_blobs(
-            make_color_mask(hsv_frame, "red", self.args.morph_kernel),
+            red_mask,
             scaled_min_area,
             scaled_max_area,
         )
         blue_blobs = extract_blobs(
-            make_color_mask(hsv_frame, "blue", self.args.morph_kernel),
+            blue_mask,
             scaled_min_area,
             scaled_max_area,
         )
@@ -3204,7 +3266,10 @@ class TrackerApp:
             previous_positions,
             TRACK_COUNT,
         )
-        self.last_search_mode = f"Full frame ({self.processing_width}x{self.processing_height})"
+        self.last_search_mode = (
+            f"Full frame ({self.processing_width}x{self.processing_height}), "
+            f"ignore patches: {len(ignore_patches)}"
+        )
         scaled_pairs = [
             None
             if pair is None

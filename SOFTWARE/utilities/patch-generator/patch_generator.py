@@ -62,6 +62,8 @@ CAMERA_FPS = 60
 DEFAULT_CALIBRATION_CSV = (
     SCRIPT_DIR.parent.parent / "firmware" / "experiments" / "tracker" / "camera_calibration.csv"
 )
+PATCH_FUNCTIONS = ("finish", "third", "corner", "point", "DQ", "ignore")
+PATCH_FUNCTION_LIMITS = {"finish": 1, "third": 2}
 SELECTED_OUTLINE_BGR = (0, 255, 255)
 SELECTED_FILL_ALPHA = 0.18
 EDIT_HANDLE_RADIUS = 7
@@ -185,10 +187,11 @@ class InvalidPatchDialog(tk.Toplevel):
         self.destroy()
 
 
-class NamePrompt(tk.Toplevel):
-    def __init__(self, parent: tk.Misc, title: str, prompt: str) -> None:
+class PatchFunctionPrompt(tk.Toplevel):
+    def __init__(self, parent: tk.Misc, title: str, prompt: str, options: list[tuple[str, str]]) -> None:
         super().__init__(parent)
         self.result: str | None = None
+        self._option_map = {label: generated_name for label, generated_name in options}
         self.title(title)
         self.resizable(False, False)
         self.transient(parent)
@@ -197,15 +200,30 @@ class NamePrompt(tk.Toplevel):
 
         self.columnconfigure(0, weight=1)
 
-        ttk.Label(self, text=prompt).grid(row=0, column=0, padx=16, pady=(16, 8), sticky="w")
+        ttk.Label(self, text=prompt, justify="left", wraplength=340).grid(
+            row=0, column=0, padx=16, pady=(16, 8), sticky="w"
+        )
 
-        self.value_var = tk.StringVar()
-        entry = ttk.Entry(self, textvariable=self.value_var, width=32)
-        entry.grid(row=1, column=0, padx=16, pady=(0, 12), sticky="ew")
-        entry.focus_set()
+        self.selection_var = tk.StringVar(value=options[0][0])
+        self.preview_var = tk.StringVar(value=f"Patch name: {options[0][1]}")
+
+        combo = ttk.Combobox(
+            self,
+            textvariable=self.selection_var,
+            values=[label for label, _generated_name in options],
+            state="readonly",
+            width=28,
+        )
+        combo.grid(row=1, column=0, padx=16, pady=(0, 8), sticky="ew")
+        combo.focus_set()
+        combo.bind("<<ComboboxSelected>>", self.update_preview)
+
+        ttk.Label(self, textvariable=self.preview_var, justify="left").grid(
+            row=2, column=0, padx=16, pady=(0, 12), sticky="w"
+        )
 
         button_row = ttk.Frame(self)
-        button_row.grid(row=2, column=0, padx=16, pady=(0, 16), sticky="e")
+        button_row.grid(row=3, column=0, padx=16, pady=(0, 16), sticky="e")
         ttk.Button(button_row, text="Cancel", command=self.cancel, style="Compact.TButton").pack(
             side=tk.LEFT, padx=(0, 8)
         )
@@ -230,16 +248,22 @@ class NamePrompt(tk.Toplevel):
         y_pos = parent_y + max((parent_h - height) // 2, 0)
         self.geometry(f"+{x_pos}+{y_pos}")
 
+    def update_preview(self, _event: tk.Event | None = None) -> None:
+        selected_label = self.selection_var.get()
+        generated_name = self._option_map.get(selected_label, "")
+        self.preview_var.set(f"Patch name: {generated_name}")
+
     def cancel(self) -> None:
         self.result = None
         self.destroy()
 
     def save(self) -> None:
-        value = self.value_var.get().strip()
-        if not value:
-            messagebox.showwarning("Name Required", "Please enter a name before saving.", parent=self)
+        selected_label = self.selection_var.get()
+        generated_name = self._option_map.get(selected_label)
+        if not generated_name:
+            messagebox.showwarning("Function Required", "Please choose a patch function.", parent=self)
             return
-        self.result = value
+        self.result = generated_name
         self.destroy()
 
 
@@ -600,6 +624,15 @@ class WebcamPatchApp:
             style=self.button_style_name,
         )
         self.move_down_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+        self.delete_patch_button = ttk.Button(
+            table_frame,
+            text="Delete",
+            command=self.delete_selected_patch,
+            state=tk.DISABLED,
+            style=self.button_style_name,
+        )
+        self.delete_patch_button.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
         self.table = ttk.Treeview(
             table_frame,
@@ -1011,8 +1044,7 @@ class WebcamPatchApp:
         mouse_position: tuple[int, int] | None,
     ) -> None:
         if current_mode == "quadpatch":
-            for point in temp_points:
-                self.draw_crosshair(frame_bgr, point, PREVIEW_RED_BGR)
+            self.draw_quadpatch_preview(frame_bgr, temp_points, mouse_position)
         elif current_mode == "circlepatch":
             if not temp_points:
                 return
@@ -1032,6 +1064,42 @@ class WebcamPatchApp:
             )
         elif current_mode == "polypatch":
             self.draw_polypatch_preview(frame_bgr, temp_points, mouse_position)
+
+    def draw_quadpatch_preview(
+        self,
+        frame_bgr: np.ndarray,
+        temp_points: list[tuple[int, int]],
+        mouse_position: tuple[int, int] | None,
+    ) -> None:
+        if not temp_points:
+            return
+
+        for point in temp_points:
+            self.draw_crosshair(frame_bgr, point, PREVIEW_RED_BGR)
+
+        if mouse_position is None:
+            return
+
+        self.draw_crosshair(frame_bgr, mouse_position, PREVIEW_RED_BGR)
+
+        if len(temp_points) == 1:
+            cv2.line(frame_bgr, temp_points[0], mouse_position, PREVIEW_RED_BGR, 2, cv2.LINE_AA)
+            return
+
+        if len(temp_points) == 2:
+            preview_points = rectangle_from_three_points(temp_points[0], temp_points[1], mouse_position)
+            if preview_points is None:
+                cv2.line(frame_bgr, temp_points[0], temp_points[1], PREVIEW_RED_BGR, 2, cv2.LINE_AA)
+                cv2.line(frame_bgr, temp_points[1], mouse_position, PREVIEW_RED_BGR, 1, cv2.LINE_AA)
+                return
+
+            self.draw_translucent_polygon(
+                frame_bgr,
+                preview_points,
+                PREVIEW_RED_BGR,
+                PREVIEW_RED_FILL_ALPHA,
+                outline_bgr=PREVIEW_RED_BGR,
+            )
 
     def draw_polypatch_preview(
         self,
@@ -1152,7 +1220,11 @@ class WebcamPatchApp:
             with self.state_lock:
                 self.temp_points.append(point)
                 point_count = len(self.temp_points)
-            if point_count == 4:
+            if point_count == 1:
+                self.status_var.set("Quadpatch mode: click a second point to set the side length and orientation.")
+            elif point_count == 2:
+                self.status_var.set("Quadpatch mode: click a third point to set the rectangle width.")
+            elif point_count == 3:
                 self.finish_quadpatch()
         elif current_mode == "circlepatch":
             with self.state_lock:
@@ -1347,7 +1419,9 @@ class WebcamPatchApp:
             self.current_mode = "quadpatch"
             self.temp_points = []
             self.mouse_position = None
-        self.status_var.set("Quadpatch mode: click 4 points in the video view.")
+        self.status_var.set(
+            "Quadpatch mode: click two points to define a side, then a third point to define the width."
+        )
 
     def finish_quadpatch(self) -> None:
         with self.state_lock:
@@ -1355,11 +1429,14 @@ class WebcamPatchApp:
             self.current_mode = None
             self.mouse_position = None
 
-        ordered = order_quad_points(raw_points)
-        if ordered is None:
+        rectangle_points = None
+        if len(raw_points) == 3:
+            rectangle_points = rectangle_from_three_points(raw_points[0], raw_points[1], raw_points[2])
+
+        if rectangle_points is None:
             messagebox.showerror(
                 "Invalid Quadpatch",
-                "The selected shape is not a convex quadrilateral. The quadpatch was cancelled.",
+                "The selected quadpatch could not define a valid rectangle. The quadpatch was cancelled.",
                 parent=self.root,
             )
             with self.state_lock:
@@ -1367,7 +1444,7 @@ class WebcamPatchApp:
             self.status_var.set("Quadpatch cancelled.")
             return
 
-        name = self.prompt_for_name("Save Quadpatch", "Enter a name for this quadpatch:")
+        name = self.prompt_for_patch_name("Save Quadpatch", "Choose a function for this quadpatch:")
         if name is None:
             with self.state_lock:
                 self.temp_points = []
@@ -1376,7 +1453,7 @@ class WebcamPatchApp:
 
         with self.state_lock:
             self.temp_points = []
-        geometry = tuple(float(value) for point in ordered for value in point)
+        geometry = tuple(float(value) for point in rectangle_points for value in point)
         self.save_patch_record(name=name, kind="quadpatch", geometry=geometry)
         self.status_var.set(f'Saved quadpatch "{name}".')
 
@@ -1402,7 +1479,7 @@ class WebcamPatchApp:
             self.status_var.set("Circlepatch cancelled.")
             return
 
-        name = self.prompt_for_name("Save Circlepatch", "Enter a name for this circlepatch:")
+        name = self.prompt_for_patch_name("Save Circlepatch", "Choose a function for this circlepatch:")
         if name is None:
             with self.state_lock:
                 self.temp_points = []
@@ -1435,10 +1512,11 @@ class WebcamPatchApp:
             self.current_mode = None
             self.mouse_position = None
 
-        if not is_convex_polygon(raw_points):
+        invalid_reason = simple_polygon_invalid_reason(raw_points, minimum_points=3)
+        if invalid_reason is not None:
             messagebox.showerror(
                 "Invalid Polypatch",
-                "The selected shape is not a convex polygon. The polypatch was cancelled.",
+                f"The selected polypatch is invalid because {invalid_reason} The polypatch was cancelled.",
                 parent=self.root,
             )
             with self.state_lock:
@@ -1446,7 +1524,7 @@ class WebcamPatchApp:
             self.status_var.set("Polypatch cancelled.")
             return
 
-        name = self.prompt_for_name("Save Polypatch", "Enter a name for this polypatch:")
+        name = self.prompt_for_patch_name("Save Polypatch", "Choose a function for this polypatch:")
         if name is None:
             with self.state_lock:
                 self.temp_points = []
@@ -1526,6 +1604,7 @@ class WebcamPatchApp:
         if not getattr(self, "video_ready", False):
             self.move_up_button.config(state=tk.DISABLED)
             self.move_down_button.config(state=tk.DISABLED)
+            self.delete_patch_button.config(state=tk.DISABLED)
             return
 
         selected_tag = None
@@ -1537,11 +1616,13 @@ class WebcamPatchApp:
         if selected_tag is None or selected_tag not in children:
             self.move_up_button.config(state=tk.DISABLED)
             self.move_down_button.config(state=tk.DISABLED)
+            self.delete_patch_button.config(state=tk.DISABLED)
             return
 
         selected_index = children.index(selected_tag)
         self.move_up_button.config(state=tk.NORMAL if selected_index > 0 else tk.DISABLED)
         self.move_down_button.config(state=tk.NORMAL if selected_index < len(children) - 1 else tk.DISABLED)
+        self.delete_patch_button.config(state=tk.NORMAL)
 
     def apply_table_selection(self, table_tag: str | None) -> None:
         self.ignore_table_select_event = True
@@ -1904,7 +1985,7 @@ class WebcamPatchApp:
         if kind == "quadpatch":
             return polygon_invalid_reason(points, minimum_points=4, required_points=4)
         if kind == "polypatch":
-            return polygon_invalid_reason(points, minimum_points=3)
+            return simple_polygon_invalid_reason(points, minimum_points=3)
         return "unsupported patch type."
 
     def is_valid_geometry(self, kind: str, geometry: tuple[float, ...]) -> bool:
@@ -1931,10 +2012,130 @@ class WebcamPatchApp:
 
         return True
 
-    def prompt_for_name(self, title: str, prompt: str) -> str | None:
-        dialog = NamePrompt(self.root, title, prompt)
+    def managed_patch_name_parts(self, name: str) -> tuple[str, int | None] | None:
+        if name == "finish":
+            return ("finish", None)
+
+        for function_name in PATCH_FUNCTIONS:
+            if function_name == "finish":
+                continue
+            if not name.startswith(function_name):
+                continue
+            suffix = name[len(function_name):]
+            if suffix.isdigit() and int(suffix) > 0:
+                return (function_name, int(suffix))
+        return None
+
+    def next_patch_name_for_function(self, function_name: str) -> str | None:
+        used_numbers: set[int] = set()
+        for patch in self.patches:
+            parts = self.managed_patch_name_parts(patch.name)
+            if parts is None:
+                continue
+            existing_function, existing_number = parts
+            if existing_function != function_name:
+                continue
+            used_numbers.add(1 if existing_number is None else existing_number)
+
+        if function_name == "finish":
+            return None if used_numbers else "finish"
+
+        limit = PATCH_FUNCTION_LIMITS.get(function_name)
+        candidate_number = 1
+        while candidate_number in used_numbers:
+            candidate_number += 1
+
+        if limit is not None and candidate_number > limit:
+            return None
+
+        return f"{function_name}{candidate_number}"
+
+    def available_patch_function_options(self) -> list[tuple[str, str]]:
+        options: list[tuple[str, str]] = []
+        for function_name in PATCH_FUNCTIONS:
+            generated_name = self.next_patch_name_for_function(function_name)
+            if generated_name is None:
+                continue
+            if function_name == "finish":
+                label = "finish"
+            else:
+                label = f"{function_name} -> {generated_name}"
+            options.append((label, generated_name))
+        return options
+
+    def prompt_for_patch_name(self, title: str, prompt: str) -> str | None:
+        options = self.available_patch_function_options()
+        if not options:
+            messagebox.showwarning(
+                "No Names Available",
+                "No valid patch function names are currently available.",
+                parent=self.root,
+            )
+            return None
+
+        dialog = PatchFunctionPrompt(self.root, title, prompt, options)
         self.root.wait_window(dialog)
         return dialog.result
+
+    def delete_selected_patch(self) -> None:
+        with self.state_lock:
+            current_mode = self.current_mode
+            selected_tag = self.selected_patch_tag
+        if current_mode is not None:
+            self.status_var.set("Finish or cancel the current patch tool before deleting a patch.")
+            return
+        if selected_tag is None:
+            self.status_var.set("Select a patch in the table to delete it.")
+            self.update_reorder_button_states()
+            return
+
+        with self.state_lock:
+            delete_index = next(
+                (index for index, patch in enumerate(self.patches) if patch.table_tag == selected_tag),
+                None,
+            )
+            if delete_index is None:
+                return
+            deleted_patch = self.patches.pop(delete_index)
+            deleted_circle_angle = self.circle_handle_angles.pop(selected_tag, None)
+            self.selected_patch_tag = None
+            self.selected_patch_original_geometry = None
+            self.selected_patch_original_wall_adjacent = None
+            self.selected_patch_original_circle_handle_angle = None
+            self.selected_patch_has_unsaved_changes = False
+            self.selected_vertex_index = None
+            self.hovered_handle_key = None
+            self.edit_drag_state = None
+
+        if self.table.exists(selected_tag):
+            self.table.delete(selected_tag)
+        self.apply_table_selection(None)
+        self.refresh_table_selection_styles()
+
+        if not self.write_all_patches_to_csv():
+            with self.state_lock:
+                self.patches.insert(delete_index, deleted_patch)
+                if deleted_circle_angle is not None:
+                    self.circle_handle_angles[selected_tag] = deleted_circle_angle
+            self.table.tag_configure(
+                deleted_patch.table_tag,
+                background=deleted_patch.outline_hex,
+                foreground=deleted_patch.text_hex,
+            )
+            self.table.insert(
+                "",
+                delete_index,
+                iid=deleted_patch.table_tag,
+                values=self.table_row_values(deleted_patch),
+                tags=(deleted_patch.table_tag,),
+            )
+            self.start_selected_patch_session(selected_tag)
+            self.apply_table_selection(selected_tag)
+            self.refresh_table_selection_styles()
+            return
+
+        self.status_var.set(f'Deleted "{deleted_patch.name}".')
+        self.update_reorder_button_states()
 
     def save_patch_record(
         self,
@@ -2248,6 +2449,7 @@ class WebcamPatchApp:
             self.calibration_button.config(state=tk.DISABLED)
             self.move_up_button.config(state=tk.DISABLED)
             self.move_down_button.config(state=tk.DISABLED)
+            self.delete_patch_button.config(state=tk.DISABLED)
             return
 
         self.load_button.config(state=tk.NORMAL)
@@ -2475,6 +2677,39 @@ def format_number(value: float) -> str:
     return f"{value:.4f}".rstrip("0").rstrip(".")
 
 
+def rectangle_from_three_points(
+    first_point: tuple[int, int],
+    second_point: tuple[int, int],
+    width_point: tuple[int, int],
+) -> list[tuple[int, int]] | None:
+    dx = second_point[0] - first_point[0]
+    dy = second_point[1] - first_point[1]
+    side_length = math.hypot(dx, dy)
+    if side_length <= 1e-6:
+        return None
+
+    normal_x = -dy / side_length
+    normal_y = dx / side_length
+    signed_width = (
+        (width_point[0] - first_point[0]) * normal_x +
+        (width_point[1] - first_point[1]) * normal_y
+    )
+    if abs(signed_width) <= 1e-6:
+        return None
+
+    third_point = (
+        int(round(second_point[0] + (normal_x * signed_width))),
+        int(round(second_point[1] + (normal_y * signed_width))),
+    )
+    fourth_point = (
+        int(round(first_point[0] + (normal_x * signed_width))),
+        int(round(first_point[1] + (normal_y * signed_width))),
+    )
+
+    rectangle = [first_point, second_point, third_point, fourth_point]
+    return rectangle if order_quad_points(rectangle) is not None else None
+
+
 def order_quad_points(points: list[tuple[int, int]]) -> list[tuple[int, int]] | None:
     if len(points) != 4 or len(set(points)) != 4:
         return None
@@ -2498,6 +2733,97 @@ def is_convex_quad(points: list[tuple[int, int]]) -> bool:
 
 def is_convex_polygon(points: list[tuple[int, int]]) -> bool:
     return polygon_invalid_reason(points) is None
+
+
+def orientation(
+    point_a: tuple[int, int],
+    point_b: tuple[int, int],
+    point_c: tuple[int, int],
+) -> int:
+    cross = (
+        (point_b[0] - point_a[0]) * (point_c[1] - point_a[1]) -
+        (point_b[1] - point_a[1]) * (point_c[0] - point_a[0])
+    )
+    if abs(cross) < 1e-6:
+        return 0
+    return 1 if cross > 0 else -1
+
+
+def on_segment(
+    point_a: tuple[int, int],
+    point_b: tuple[int, int],
+    point_c: tuple[int, int],
+) -> bool:
+    return (
+        min(point_a[0], point_c[0]) <= point_b[0] <= max(point_a[0], point_c[0]) and
+        min(point_a[1], point_c[1]) <= point_b[1] <= max(point_a[1], point_c[1])
+    )
+
+
+def segments_intersect(
+    start_a: tuple[int, int],
+    end_a: tuple[int, int],
+    start_b: tuple[int, int],
+    end_b: tuple[int, int],
+) -> bool:
+    o1 = orientation(start_a, end_a, start_b)
+    o2 = orientation(start_a, end_a, end_b)
+    o3 = orientation(start_b, end_b, start_a)
+    o4 = orientation(start_b, end_b, end_a)
+
+    if o1 != o2 and o3 != o4:
+        return True
+
+    if o1 == 0 and on_segment(start_a, start_b, end_a):
+        return True
+    if o2 == 0 and on_segment(start_a, end_b, end_a):
+        return True
+    if o3 == 0 and on_segment(start_b, start_a, end_b):
+        return True
+    if o4 == 0 and on_segment(start_b, end_a, end_b):
+        return True
+
+    return False
+
+
+def simple_polygon_invalid_reason(
+    points: list[tuple[int, int]],
+    minimum_points: int = 3,
+    required_points: int | None = None,
+) -> str | None:
+    if required_points is not None and len(points) != required_points:
+        return f"it needs exactly {required_points} points."
+    if len(points) < minimum_points:
+        return f"it needs at least {minimum_points} points."
+    if len(set(points)) != len(points):
+        return "two or more points overlap."
+
+    point_count = len(points)
+    for index in range(point_count):
+        p1 = points[index]
+        p2 = points[(index + 1) % point_count]
+        p3 = points[(index + 2) % point_count]
+        cross = (p2[0] - p1[0]) * (p3[1] - p2[1]) - (p2[1] - p1[1]) * (p3[0] - p2[0])
+        if abs(cross) < 1e-6:
+            return "at least three neighboring points are collinear."
+
+    for index_a in range(point_count):
+        a_start = points[index_a]
+        a_end = points[(index_a + 1) % point_count]
+        for index_b in range(index_a + 1, point_count):
+            if index_b == index_a:
+                continue
+            if index_b == (index_a + 1) % point_count:
+                continue
+            if index_a == 0 and index_b == point_count - 1:
+                continue
+
+            b_start = points[index_b]
+            b_end = points[(index_b + 1) % point_count]
+            if segments_intersect(a_start, a_end, b_start, b_end):
+                return "the polygon crosses over itself."
+
+    return None
 
 
 def polygon_invalid_reason(
@@ -2598,8 +2924,9 @@ def parse_csv_row(row: list[str]) -> tuple[str, str, tuple[float, ...], bool] | 
             (int(round(numbers[index])), int(round(numbers[index + 1])))
             for index in range(0, len(numbers), 2)
         ]
-        if not is_convex_polygon(point_pairs):
-            raise ValueError("Polypatch rows must define a convex polygon.")
+        invalid_reason = simple_polygon_invalid_reason(point_pairs, minimum_points=3)
+        if invalid_reason is not None:
+            raise ValueError(f"Polypatch rows are invalid because {invalid_reason}")
         geometry = tuple(float(value) for point in point_pairs for value in point)
         return (name, kind, geometry, wall_adjacent)
 
